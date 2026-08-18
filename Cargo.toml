@@ -1,0 +1,26 @@
+[package]
+name = "sparrow-mpm"
+version = "0.1.0"
+edition = "2021"
+description = "SPARROW: sparse-position, entropy-optimized SIMD multi-pattern matching with provable filter guarantees"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/greencm/perturb"
+
+[lib]
+name = "sparrow"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+aho-corasick = "1.1"
+
+[profile.release]
+debug = true
+lto = true
+codegen-units = 1
+
+[features]
+# Exhaustively enumerate every sampled-position subset instead of the pruned
+# top-scoring candidate set. Slower builds, identical guarantees.
+exhaustive-search = []

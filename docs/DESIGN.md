@@ -13,7 +13,9 @@ report **every** occurrence `(i, q)` with `H[q .. q+|p_i|] = p_i`
 (all patterns, all positions, overlaps included). This is the classic
 multi-pattern (multi-literal) matching problem at the core of intrusion
 detection (Snort/Suricata via Hyperscan), grep tooling (ripgrep via the
-`aho-corasick` crate), and antivirus scanning.
+`aho-corasick` crate), and antivirus scanning. SPARROW additionally supports
+ASCII-case-insensitive matching, single-byte wildcards in patterns
+(`?`-globs), streaming input, and leftmost-nonoverlapping semantics.
 
 ## 2. State of the art
 
@@ -31,7 +33,7 @@ patterns share filter resources*:
 | **DFC** (NSDI'16) | 2-byte direct filter windows | fixed small windows | hash-based |
 | Vectorized AC (SCPE 2019 etc.) | every byte; SIMD accelerates transitions | — | — |
 
-Two structural constants stand out across every family:
+Three structural constants stand out across every family:
 
 1. **Contiguity.** The filter always inspects a *fixed, contiguous* run of
    pattern bytes (prefix, suffix, or whole literal). No published member of
@@ -41,229 +43,285 @@ Two structural constants stand out across every family:
    sets (e.g. bucket bytes `{0x41, 0x62}` also pass `0x42` and `0x61`).
    Every Teddy descendant pays this inflation, and none of them accounts
    for it when grouping patterns into buckets.
+3. **Fixed resource spend.** How many filter bytes, how many buckets, and
+   one filter for the whole pattern set — decided by the implementation,
+   not by the workload.
 
-Both constants are exploitable weaknesses. Contiguous prefixes are
+These constants are exploitable weaknesses. Contiguous prefixes are
 catastrophic when patterns share a common prefix ("GET /api/v1/…",
-`\x7fELF`, TLS record headers…), which is the *common case* in the very
-workloads these engines serve. And nibble inflation silently multiplies the
-candidate rate when heuristic bucketing mixes patterns whose nibble sets
-combine badly.
+`\x7fELF`, TLS record headers…) — the *common case* in the workloads these
+engines serve — and correlated bytes make heuristic resource choices
+silently wrong.
 
 ## 3. The SPARROW design
 
 SPARROW keeps the proven Teddy runtime shape — nibble shuffles producing
-8-bucket bitmaps, shifted and ANDed, then verified — and replaces both
-structural constants with an offline optimizer:
+bucket bitmaps, ANDed and then verified — and turns every structural
+constant into an optimizer decision:
 
 * **Sparse sampled positions.** The filter inspects `k ≤ 4` positions
   `S = {s_1 < … < s_k}` chosen *anywhere* in the anchor window
-  `[0, w)`, `w = min(min_i |p_i|, 16)` — not necessarily contiguous, not
+  `[0, w)`, `w = min(min_i |p_i|, 32)` — not necessarily contiguous, not
   necessarily including position 0.
-* **Model-driven, closure-aware optimization.** Both the position set and
-  the assignment of patterns to the 8 buckets are chosen to minimize the
-  *exact* expected verification cost per haystack byte under a byte
-  distribution `π` (estimated from a user-supplied corpus sample, with
-  Laplace smoothing), where the cost model includes the nibble
-  cross-product closure *exactly* rather than ignoring it.
+* **Optimized, closure-aware bucketing.** Patterns are assigned to 8 or 16
+  buckets (1 or 2 SIMD "planes") minimizing an exact expected-cost
+  objective that includes the nibble cross-product closure.
+* **Cost-arbitrated resources.** The same objective — verification work
+  plus a calibrated per-term scan cost — decides how many positions to
+  sample, whether a second bucket plane pays for itself, and whether to
+  split the pattern set into **length cohorts** (separate filters, each
+  scanning the haystack once; the extra pass is priced in).
+* **Empirical final selection.** Finalist configurations are re-scored by
+  running the exact candidate filter over the corpus sample and counting
+  real candidates — capturing byte correlations no closed-form model can
+  (see §5.1).
 
 ### 3.1 Compiled form
 
-For each sampled position `s_j` and bucket `b ∈ {0..7}`:
+For each plane, sampled position `s_j`, and bucket bit `b`:
 
-* `Lo_b(j) = { lo(p[s_j]) : p ∈ bucket b }`, `Hi_b(j)` analogously
-  (`lo(x) = x & 15`, `hi(x) = x >> 4`).
-* Shuffle tables `TL_j[ν] = Σ_b [ν ∈ Lo_b(j)] · 2^b` and
-  `TH_j[ν] = Σ_b [ν ∈ Hi_b(j)] · 2^b` (16 bytes each).
-* The **closure class** actually recognized is
-  `C_b(j) = { x : lo(x) ∈ Lo_b(j) ∧ hi(x) ∈ Hi_b(j) } ⊇ {bytes at s_j}`.
+* Each pattern presents a **class** at `s_j`: nibble sets
+  `(Lo, Hi)` — singletons for an exact byte, both cases' nibbles under
+  case-insensitivity, all nibbles for a wildcard byte.
+* Shuffle tables `TL_j[ν]`, `TH_j[ν]` hold the OR of member bucket bits per
+  nibble; the byte set actually recognized for bucket `b` is the closure
+  `C_b(j) = { x : lo(x) ∈ Lo_b(j) ∧ hi(x) ∈ Hi_b(j) }`.
+* Each bucket entry additionally stores a **guard probe**: the offset and
+  byte of the model-rarest pattern byte *outside* the sampled positions.
 
-Let `s_last = s_k` and carry distances `d_j = s_last − s_j ∈ [0, 15]`.
+Let `s_last = s_k` and `d_j = s_last − s_j`.
 
-### 3.2 Runtime kernel (AVX2)
+### 3.2 Runtime kernels (AVX2 and AVX-512BW)
 
-Per 32-byte block at offset `o`, with per-position carry registers `prev_j`
-(zero-initialized — "nothing matches before the buffer"):
+The kernels use an **offset-load** structure: per block at offset `o`, for
+each position `j` the input is loaded once *at `o − d_j`* (an unaligned
+load), so every class mask is born already aligned to the anchor —
+eliminating the carry registers, cross-lane `PALIGNR` shifting, and
+per-block shift dispatch of Teddy-style kernels, and lifting the anchor
+window from 16 to 32 bytes (the alignr idiom caps carry distances at 15).
+Blocks start at offset 32; anchors `[0, 32)` and the tail run through the
+scalar engine, which shares the same precomposed byte→bitmap tables.
 
-1. `R_j = PSHUFB(TL_j, in & 0x0F) & PSHUFB(TH_j, (in >> 4) & 0x0F)` —
-   byte `t` of `R_j` is the bitmap of buckets whose closure class at
-   position `j` contains `H[o+t]`. (2 shuffles + 3 logic ops.)
-2. `A_j = shift_carry(prev_j, R_j, d_j)` — byte `t` becomes `R_j` evaluated
-   at `t − d_j`, borrowing the previous block's tail
-   (`VPERM2I128` + `VPALIGNR`, the standard cross-lane byte-shift idiom).
-3. `cand = A_1 & … & A_k`; `prev_j ← R_j`.
-4. If `cand ≠ 0` (one `VPCMPEQB` + `VPMOVMSKB` test): for each nonzero byte
-   `t` and each set bit `b`, the verifier memcmp-checks every pattern of
-   bucket `b` at start `o + t − s_last`.
-
-Total: `5k + k + 2 ≈ 26` cheap SIMD ops per 32 bytes at `k = 4`, identical
-to a 4-byte Teddy — sparsity is free at runtime; only the *choice* of
-positions moved offline. A portable scalar engine uses the precomposed
-256-entry byte→bitmap tables (`TL_j[lo] & TH_j[hi]`), giving bit-identical
-filter semantics on any architecture.
+Per block: `R_j^p = PSHUFB(TL_j^p, in_j & 0xF) & PSHUFB(TH_j^p, in_j >> 4)`
+and `cand^p = ∧_j R_j^p` per plane `p`; a nonzero-byte test
+(`VPCMPEQB`+`VPMOVMSKB` on AVX2, a single `VPTESTMB` mask on AVX-512)
+gates extraction; each set bit `(b, t)` sends start `o + t − s_last` to the
+verifier, which checks the guard probe before the full (case-/wildcard-
+aware) comparison. Kernels are monomorphized over `(k, planes)` via const
+generics, so position loops fully unroll. A portable scalar engine is
+bit-identical in filter semantics on any architecture.
 
 ### 3.3 The optimizer
 
-Let `π` be the model distribution and
-`P_b(j) = Σ_{x ∈ C_b(j)} π(x)` the closure-class probability. Define the
-objective
+Let `π` be the corpus-estimated byte distribution and
+`P_b(j) = Σ_{x ∈ C_b(j)} π(x)`. The **total model cost** per haystack byte
+of a configuration (positions `S`, plane count `m`, assignment) is
 
 ```
-E(S, assignment) = Σ_{b nonempty} (c₀ + |bucket b|) · Π_{j=1..k} P_b(j)
+T = Σ_{b nonempty} (c₀ + |bucket b|) · Π_{j=1..k} P_b(j)  +  γ · k · m
 ```
 
-(`c₀ = 2` models fixed per-candidate overhead in units of one pattern
-comparison). Section 4 proves `E` is the exact expected verification cost
-per haystack byte under i.i.d. `π`.
+with `c₀ = 6` (measured per-candidate overhead: mispredicted branch, mask
+store, bit loop) and `γ = 0.003 → 0.002` calibrated so one scan term
+(~0.1 ns/byte) is priced in guard-probe units (~10 ns each). Section 4
+proves the first term is the exact expected verification cost under i.i.d.
+`π`.
 
-* **Position search:** positions are ranked by the rarity of the pattern
-  bytes they expose (`Σ_i π(p_i[s])`); all subsets of size `≤ k` of the top
-  9 (or of the whole window with `exhaustive-search`) are scored by a
-  greedy assignment, *always including the contiguous prefix
-  `{0..k−1}` as a baseline*.
-* **Greedy assignment:** patterns are inserted in decreasing solo
-  probability; each goes to the bucket with the smallest exact marginal
-  `ΔE`. Closure probabilities are maintained incrementally in `O(16)` per
-  update via row/column partial sums of the 16×16 nibble matrix, so the
-  marginal including inflation is exact, not approximated.
-* **Refinement:** the best few position sets (and always the prefix
-  baseline) get a local search that keeps moving single patterns to
-  strictly-better buckets until fixpoint; the overall minimum wins.
+Search: candidate position sets are all subsets (size ≤ 4) of the 9
+most-discriminating window positions (all subsets with `exhaustive-search`),
+scored by a greedy assignment; **finalists** — the best few overall, the
+best set *of every size*, and always the contiguous prefix — are refined by
+local search over both plane counts and re-scored by the **empirical
+referee** (§5.1). The minimum total wins. Cohort partitioning (§3.4) then
+compares the single filter against a length-banded split by summing each
+side's total cost.
 
-Compilation is polynomial and takes well under a second for typical rule
-sets (hundreds of patterns).
+Greedy assignment inserts patterns in decreasing solo probability into the
+bucket with the smallest exact marginal `ΔT`; refinement keeps moving
+single patterns to strictly-better buckets until fixpoint.
+
+### 3.4 Length cohorts
+
+The anchor window is capped by the shortest pattern, so one short pattern
+can blind the filter for everyone. When lengths are diverse, patterns are
+banded (`[1,4), [4,8), [8,16), [16,32), [32,∞)`, small bands merged), each
+band compiled into its own filter with its own window, and the split is
+adopted iff the summed total cost — which charges each cohort its own scan
+term, i.e. the extra haystack pass — beats the single filter.
 
 ## 4. Guarantees
 
 **Lemma 1 (closure exactness).** For every bucket `b` and position `j`, the
 byte set recognized by the compiled tables is exactly
-`C_b(j) = {x : lo(x) ∈ Lo_b(j) ∧ hi(x) ∈ Hi_b(j)}`.
+`C_b(j) = {x : lo(x) ∈ Lo_b(j) ∧ hi(x) ∈ Hi_b(j)}`, where `(Lo_b, Hi_b)`
+are the unions of member classes (case pairs and wildcards included).
 
 *Proof.* Byte `x` passes iff bit `b` is set in both `TL_j[lo(x)]` and
 `TH_j[hi(x)]`; by construction that holds iff `lo(x) ∈ Lo_b(j)` and
-`hi(x) ∈ Hi_b(j)`. The scalar tables are defined as
-`TL_j[lo] & TH_j[hi]`, hence identical. ∎
+`hi(x) ∈ Hi_b(j)`. The scalar tables are defined as `TL_j[lo] & TH_j[hi]`,
+hence identical. ∎
 
 **Theorem 1 (zero false negatives).** Every occurrence `(i, q)` of every
-pattern is reported, by both engines.
+pattern (under the configured semantics) is reported, by every engine.
 
-*Proof.* Let pattern `p_i` sit in bucket `b` and occur at `q`, i.e.
-`H[q + s] = p_i[s]` for all `s < |p_i|`. Consider anchor `t* = q + s_last`.
-Since `s_last < w ≤ |p_i|` and `q + |p_i| ≤ |H|`, we get `t* < |H|`, so
-`t*` lies in some processed block or the scalar tail (the two ranges
-partition `[0, |H|)`). For each `j`: `t* − d_j = q + s_j ≥ 0`, and
-`H[q + s_j] = p_i[s_j] ∈ C_b(j)` by Lemma 1 and table construction, so bit
-`b` survives every ANDed term (the zero-initialized carry only affects
-`t < d_j`, and `t* ≥ s_last ≥ d_j`). Hence `cand[t*]` has bit `b`; the
-verifier computes start `t* − s_last = q ≥ 0`, compares
-`H[q .. q+|p_i|]` with `p_i`, which succeeds, and emits `(i, q)`. The
-scalar engine evaluates the same tables at the same anchors. No candidate
-is ever dropped without verification; verification is an exact memcmp, so
-no false positives are reported either. ∎
+*Proof.* Pattern `p_i` belongs to exactly one cohort; consider that
+cohort's filter, bucket `b`, plane `p`. An occurrence at `q` means every
+non-wildcard byte satisfies `byte_matches`, so for each sampled `s_j`,
+`H[q+s_j] ∈ C_b(j)` (the pattern's class at `s_j` is contained in the
+bucket union; Lemma 1). Consider anchor `t* = q + s_last < |H|` (since
+`s_last < w ≤ |p_i|` and `q + |p_i| ≤ |H|`). Anchor `t*` is processed
+exactly once: by the scalar prelude if `t* < 32`, by some SIMD block
+`[o, o+B)` if `32 ≤ t* < blocks_end`, or by the scalar tail. In a block,
+position `j`'s load at `o − d_j` puts `H[t* − d_j] = H[q + s_j]` in lane
+`t* − o` (in bounds: `o ≥ 32 > d_j`), so bit `b` survives every ANDed term;
+the scalar engine indexes the same bytes directly (`t* ≥ s_last ≥ d_j`).
+The verifier computes start `t* − s_last = q ≥ 0`; the guard probe is at a
+non-wildcard offset `g` with pattern byte `p_i[g]`, and `byte_matches
+(H[q+g], p_i[g])` holds because the occurrence matches everywhere, so the
+guard never rejects a true occurrence; the full comparison then succeeds
+and `(i, q)` is emitted. Candidates are never dropped without
+verification, and verification is exact for the configured semantics, so
+no false positives are reported either. Streaming: a match ending in the
+current chunk starts at most `max_len − 1` bytes earlier, which the carried
+tail preserves; the `end > tail_len` filter reports each match exactly once
+(ends inside the tail were reported by the previous push, by induction). ∎
 
 **Theorem 2 (exact expected filter cost).** If haystack bytes are i.i.d.
-with distribution `π`, then for any anchor `t ≥ s_last`, the expected
-number of pattern comparisons plus weighted candidate overhead per byte is
-exactly `E(S, assignment)` from §3.3.
+with distribution `π`, the expected verification work per anchor is exactly
+the first term of `T` in §3.3.
 
 *Proof.* Bit `(b, t)` of `cand` is set iff `H[t − d_j] ∈ C_b(j)` for all
-`j` (Lemma 1 plus kernel definition). The inspected offsets
-`t − d_j = t − s_last + s_j` are pairwise distinct because the `s_j` are,
-so under i.i.d. `π` the events are independent:
-`Pr[bit (b,t)] = Π_j P_b(j)`. A set bit costs `c₀` overhead plus `|bucket
-b|` comparisons (the verifier scans the whole bucket). Linearity of
-expectation over buckets gives `E` exactly. Note the closure `C_b(j)` — not
-the raw byte sets — appears, so nibble inflation is fully accounted. ∎
+`j` (Lemma 1 plus kernel definition). The inspected offsets are pairwise
+distinct because the `s_j` are, so under i.i.d. `π` the events are
+independent: `Pr[bit (b,t)] = Π_j P_b(j)`. A set bit costs `c₀` overhead
+plus `|bucket b|` probes. Linearity of expectation over buckets gives the
+sum exactly. The closure `C_b(j)` — not the raw byte sets — appears, so
+nibble inflation is fully accounted. ∎
 
 **Theorem 3 (refinement terminates at move-optimality).** The local search
 terminates and returns a partition where no single pattern can move to
 another bucket with cost improvement `> ε` (`ε = 10⁻¹⁵`).
 
-*Proof.* Each accepted move strictly decreases `E` by more than `ε`; `E` is
-bounded below by 0, and its initial value is finite, so at most `E₀/ε`
-moves occur (a pass cap enforces this in practice). At exit, no improving
-move exists — the definition of move-optimality. ∎
+*Proof.* Each accepted move strictly decreases the objective by more than
+`ε`; it is bounded below by 0 and starts finite, so at most `T₀/ε` moves
+occur (a pass cap enforces this in practice). At exit, no improving move
+exists — the definition of move-optimality. ∎
 
 **Theorem 4 (never worse than the contiguous-prefix choice, under the
-model).** The compiled configuration satisfies
-`E* ≤ E(prefix, refined-greedy(prefix))`, i.e. under the model SPARROW's
-choice is never worse than a Teddy-style prefix filter compiled through the
-same pipeline.
+selection model).** The compiled configuration satisfies `T* ≤ T(prefix)`,
+where both sides are scored by the same selection model (empirical referee
+when enabled, closed-form otherwise) after the same greedy + refinement
+pipeline.
 
-*Proof.* The prefix set is unconditionally included among the finalists
-that undergo greedy assignment + refinement, and the final configuration is
-the argmin over finalists. ∎
+*Proof.* The prefix set is unconditionally a finalist, undergoes the same
+refinement and scoring, and the final configuration is the argmin over
+finalists. (Cohort splitting can only replace this choice by a
+strictly-cheaper one under the same model, preserving the inequality.) ∎
 
-**Complexity.** Compile: `O(#sets · n · 8 · 16k)` flops plus refinement;
-search space is `O(Σ_{j≤4} C(9, j)) = 255` sets by default. Scan:
-`⌈|H|/32⌉ · O(k)` SIMD ops plus expected `|H| · E` verification work;
-worst-case (adversarial haystack) `O(|H| · Σ_b |b|)` comparisons — the same
-worst case as every filter-based engine, with the expected case provably
-minimized within the searched family.
+**Complexity.** Compile: polynomial — `O(#sets · n · buckets · k · 256)`
+flops for the search plus `O(|corpus| · k)` per finalist for the referee.
+Scan: `⌈|H|/B⌉ · O(k · m)` SIMD ops per cohort (B = 32 or 64) plus
+expected verification work `|H| · T_verif`; worst case (adversarial
+haystack) `O(|H| · Σ_b |b|)` probes — the same worst case as every
+filter-based engine, with the expected case minimized within the searched
+family.
 
 ## 5. What is new, and what "provable" means here
 
 Mathematical novelty of an algorithm cannot be "proven" the way a theorem
 can — it is a claim about the literature. What can be done honestly is
-(a) prove the algorithm's properties (Theorems 1–4 above), and (b) exhibit
-the precise mechanical deltas from every published family:
+(a) prove the algorithm's properties (Theorems 1–4), and (b) exhibit the
+mechanical deltas from every published family:
 
-1. **Sparse, non-contiguous filter positions.** Teddy fixes positions
-   `0..m`; FDR fixes a contiguous suffix domain; Harry uses all positions
-   contiguously; DFC uses fixed 2-byte windows. SPARROW selects an
-   arbitrary `k`-subset of the anchor window per pattern *set* (not per
-   pattern), which is what lets it keep the one-shuffle-per-position
-   runtime while escaping shared-prefix blindness. We are not aware of any
+1. **Sparse, non-contiguous filter positions**, selected per pattern set by
+   optimization. Teddy fixes positions `0..m`; FDR a contiguous suffix;
+   Harry all positions; DFC fixed 2-byte windows. We are not aware of any
    published multi-pattern SIMD filter that optimizes *which* positions the
-   SIMD filter inspects.
-2. **Closure-aware exact objective.** No Teddy descendant models the
-   PSHUFB nibble cross-product inflation; SPARROW's objective computes it
-   exactly (Lemma 1 + Theorem 2) and both the position choice and the
-   bucket partition minimize it.
-3. **Bucket assignment as optimization with guarantees.** Existing engines
-   bucket heuristically (insertion order, size balancing). SPARROW's
-   greedy + local-search assignment carries Theorem 3's move-optimality
-   and Theorem 4's dominance over the classic configuration.
+   filter inspects.
+2. **Offset-load kernel structure.** Teddy-family kernels align class masks
+   with cross-lane byte shifts carried between blocks; SPARROW instead
+   re-loads the input at per-position offsets, deleting the carry state and
+   shift dispatch and doubling the reachable window (16 → 32 bytes). (The
+   trick is only useful *because* positions are sparse and few — a whole-
+   literal matcher like Harry could not afford one load per position.)
+3. **Closure-aware exact objective** (Lemma 1 + Theorem 2) driving bucket
+   assignment — existing engines bucket heuristically and ignore nibble
+   inflation.
+4. **Cost-model-arbitrated resource allocation**: the number of sampled
+   positions, 8-vs-16 buckets, and single-filter-vs-length-cohorts are all
+   decided by one calibrated objective with a proven verification term —
+   not hardcoded.
+5. **Empirical finalist selection** (§5.1): final configurations are chosen
+   by measured candidate counts on a corpus sample, not by a closed-form
+   model.
 
-The runtime kernel itself (nibble shuffles, shifted ANDs, verify) is
-deliberately *not* new — it reuses the hardware-proven Teddy shape, so all
-gains come from the provably-modeled offline choices.
+The runtime primitive (nibble shuffles → bucket bitmaps → verify) is
+deliberately *not* new — it is the hardware-proven Teddy shape, so gains
+come from the provably-modeled offline choices plus the kernel
+restructuring in (2).
+
+### 5.1 Why an empirical referee (and not Markov-1)
+
+The i.i.d. objective is exact under independence (Thm 2) but real data is
+correlated, and the failure mode is systematic: positions shared by all
+patterns *and* by the background (a common prefix like "GET /api/v1/")
+look like `k` independent rare events (`p^k`) when they are one event
+(`p`). A first-order Markov re-scorer was implemented and evaluated; it
+narrows the gap (×5 on our log workload) but still underprices long-range
+determinism by ~200×, because gap-bridging via `M^gap` diffuses through
+transition branching. It was replaced by something strictly stronger and
+cheaper: **run the exact compiled filter over the corpus sample and count
+per-bucket candidates** — `O(|corpus| · k)` per finalist, exact for the
+sample, and correct under *arbitrary* correlation. The closed-form
+objective still powers the combinatorial search (it is exact per Thm 2 and
+incrementally computable); the empirical referee makes the final call.
+On the shared-prefix benchmark this single change moved the chosen
+configuration from a correlation-blinded one (0.75 GB/s) to `[0, 1, 14]`
+(6.2 GB/s).
 
 ## 6. Measured results
 
-16 MiB haystacks, best of 5, one core (AVX2; Rust 1.94, `-C lto`,
-this repo's `examples/bench.rs`; `aho-corasick` v1.1 as the baseline —
+16 MiB haystacks, best of 5, one core (AVX2 + AVX-512BW machine; Rust
+1.94, `-C lto`; this repo's `examples/bench.rs`; `aho-corasick` v1.1 —
 its packed searcher is the reference Teddy implementation):
 
-| Workload | SPARROW | SPARROW (prefix ablation) | AC DFA (overlapping) | Teddy (packed, leftmost) |
-|---|---|---|---|---|
-| 16 English words / English text | 0.63 GB/s | 0.63 | 0.37 | 0.68 |
-| 64 random len-8 / random bytes | 2.46 GB/s | 2.49 | 0.38 | 3.08 |
-| 16 shared-prefix routes / near-miss log | **2.80 GB/s** | 0.51 | 1.34 | 0.69 |
+| Workload | SPARROW AVX-512 | SPARROW AVX2 | prefix ablation | AC DFA (ovlp) | Teddy (packed) |
+|---|---|---|---|---|---|
+| 16 English words / English text | 0.64 GB/s | 0.72 | 0.63 | 0.36 | 0.71 |
+| 64 random len-8 / random bytes | **4.35 GB/s** | 3.30 | 4.26 | 0.38 | 3.38 |
+| 16 shared-prefix routes / near-miss log | **6.20 GB/s** | 5.44 | 0.68 | 1.39 | 0.69 |
+| 24 short words + 24 long signatures | 0.19 GB/s | 0.20 | 0.19 | 0.33 | 0.40 |
 
-* The shared-prefix workload is the structural weakness the design targets:
-  SPARROW is **4.1× faster than the reference Teddy** and 5.5× faster than
-  its own prefix ablation — the position optimizer, not kernel tuning,
-  accounts for the whole win (the ablation shares every line of runtime
-  code). The model predicted the gap: expected cost 4.2·10⁻⁶ vs
-  2.2·10⁻⁵ per byte.
-* On neutral workloads SPARROW matches the far more engineering-tuned
-  Teddy within ~20% while additionally reporting *all* overlapping matches
-  (Teddy's packed API is leftmost-first only).
+* **Shared prefixes** (the structural blind spot of prefix-anchored
+  filters): **9× the reference Teddy** and 9× SPARROW's own prefix
+  ablation — same kernel, different sampled positions, so the win is
+  attributable entirely to the position optimizer + empirical referee
+  (which chose `[0, 1, 14]`, k = 3).
+* **Random patterns**: 4.35 GB/s vs Teddy's 3.38 — the 16-bucket plane
+  mode and position choice give a 29% edge even on Teddy's home turf.
+* **Match-heavy English**: parity with Teddy (0.72 vs 0.71) while
+  reporting *all* overlapping matches (packed Teddy is leftmost-only).
+* **The mixed workload is an honest loss**: 0.93M true matches
+  (0.055/byte, dominated by "the"/"and") make every filter irrelevant and
+  reward AC's amortized automaton. The model cost (0.57/byte) predicts
+  exactly this; cohort splitting is correctly rejected because short-word
+  verification dominates both ways.
 * Match counts agree exactly with Aho–Corasick's overlapping iterator in
   all workloads (asserted in the harness, and in the differential fuzz
-  tests against a brute-force oracle).
+  tests against a brute-force oracle, across all three engines).
 
 ## 7. Limitations and extensions
 
-* The anchor window is bounded by the shortest pattern; a 1-byte minimum
-  pattern degrades the filter to one position (as it does Teddy). Length
-  cohorts (multiple SPARROW instances by length class) are the natural
-  extension.
-* Theorem 2's expectation is exact under the i.i.d. model `π`; real data is
-  correlated. The corpus-sample API narrows the gap empirically; a Markov-1
-  objective is a straightforward extension (the closure algebra is
-  unchanged; only the probability terms generalize).
-* AVX-512 doubles block width; VBMI's `VPERMB` would allow 64-entry
-  (6-bit) classes, shrinking the closure inflation Lemma 1 quantifies.
-* Streaming (matches across buffer boundaries) needs the standard carry of
-  `min_len − 1` history bytes plus the existing `prev_j` registers.
+* Selectivity is still bounded by the shortest cohort's window; a 1-byte
+  pattern degrades its cohort to one position (as it would Teddy).
+* The empirical referee is exact for the *sample*; a sample unlike the
+  real traffic mis-ranks finalists (correctness is never affected —
+  Theorem 1 is unconditional). The `corpus_sample` API exists precisely to
+  close this gap.
+* The scan-cost constants (`c₀`, `γ`) are calibrated for the benchmarked
+  microarchitecture; a per-build microbenchmark could set them adaptively.
+* AVX-512 VBMI (`VPERMB`, 64-entry tables → 6-bit classes) would shrink
+  the closure inflation Lemma 1 quantifies; ARM NEON (`TBL` is a 16-byte
+  shuffle) is a near-mechanical port of the scalar/AVX2 pair.
+* Verification scans whole buckets; for very large rule sets a per-bucket
+  hash or sorted-by-guard layout would sublinearize it.

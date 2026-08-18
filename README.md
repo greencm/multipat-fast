@@ -2,72 +2,101 @@
 
 SPARROW (*Sparse Position Adaptive Rejection Over Rolling Windows*) is a
 multi-pattern (multi-literal) string matcher that keeps the hardware-proven
-Teddy/Hyperscan SIMD kernel shape — PSHUFB nibble shuffles producing
-8-bucket candidate bitmaps, then exact verification — but replaces the two
-fixed structural choices every published engine hardcodes:
+Teddy/Hyperscan SIMD primitive — PSHUFB nibble shuffles producing bucketed
+candidate bitmaps, then exact verification — but turns every structural
+choice those engines hardcode into an optimizer decision:
 
 1. **Which pattern bytes the filter inspects.** Teddy inspects the first
    1–4 bytes; FDR the last bytes; Harry the whole literal — always a
    *contiguous* run. SPARROW samples a **sparse, optimizer-chosen set of
-   ≤ 4 positions** anywhere in the patterns' common anchor window, at
-   identical runtime cost.
-2. **How patterns share SIMD buckets.** Existing engines bucket
-   heuristically. SPARROW assigns patterns to buckets by minimizing an
-   **exact expected-verification-cost objective** under a byte-distribution
-   model — one that models the PSHUFB nibble cross-product inflation
-   exactly, a filter loss all Teddy descendants pay but none account for.
+   ≤ 4 positions** anywhere in a 32-byte anchor window.
+2. **How patterns share SIMD buckets.** Assigned by minimizing an exact
+   expected-cost objective that models the PSHUFB nibble cross-product
+   inflation — a filter loss all Teddy descendants pay and none account
+   for.
+3. **How much filter to buy.** The number of sampled positions, 8 vs 16
+   buckets (one or two SIMD planes), and whether to split the pattern set
+   into per-length cohort filters are all arbitrated by one calibrated
+   cost model.
+4. **Which configuration ships.** Finalists are re-scored by an
+   **empirical referee** — the exact compiled filter run over a corpus
+   sample, counting real candidates — which captures byte correlations
+   (shared prefixes, protocol framing) that defeat every closed-form model.
 
-Proved in [`docs/DESIGN.md`](docs/DESIGN.md): zero false negatives
-(Thm 1), exactness of the cost objective under the i.i.d. byte model
-(Thm 2), termination + move-optimality of the bucket refinement (Thm 3),
-and model-dominance over the classic contiguous-prefix configuration
-(Thm 4). The same document surveys the prior families (Aho–Corasick, FDR,
-Teddy, Harry, DFC) and states precisely which mechanisms are new — and
-what "provable" can and cannot mean for a novelty claim.
+Proved in [`docs/DESIGN.md`](docs/DESIGN.md): zero false negatives (under
+all supported semantics, streaming included), exactness of the objective's
+verification term under the i.i.d. byte model, termination +
+move-optimality of bucket refinement, and dominance over the classic
+contiguous-prefix configuration under the selection model. The same
+document surveys the prior families (Aho–Corasick, FDR, Teddy, Harry,
+DFC), states precisely which mechanisms are new, and reports an honest
+negative result (a Markov-1 re-scorer, implemented and replaced by the
+strictly better empirical referee).
 
-## Results (16 MiB haystacks, AVX2, one core, best of 5)
+## Results (16 MiB haystacks, one core, best of 5)
 
-| Workload | SPARROW | SPARROW prefix-ablation | aho-corasick DFA | aho-corasick Teddy |
-|---|---|---|---|---|
-| English words / English text | 0.63 GB/s | 0.63 | 0.37 | 0.68 |
-| 64 random len-8 / random bytes | 2.46 GB/s | 2.49 | 0.38 | 3.08 |
-| shared-prefix routes / near-miss log | **2.80 GB/s** | 0.51 | 1.34 | 0.69 |
+| Workload | SPARROW (best engine) | aho-corasick Teddy (packed) | aho-corasick DFA |
+|---|---|---|---|
+| English words / English text | 0.72 GB/s | 0.71 | 0.36 |
+| 64 random len-8 / random bytes | **4.35 GB/s** | 3.38 | 0.38 |
+| shared-prefix routes / near-miss log | **6.20 GB/s** | 0.69 | 1.39 |
+| short words + long signatures (match-heavy) | 0.20 GB/s | 0.40 | 0.33 |
 
 Shared prefixes (`GET /api/v1/…`, magic numbers, protocol headers) are the
-common case in IDS/log scanning and are the structural blind spot of
-prefix-anchored filters: there SPARROW is **4.1× faster than the reference
-Teddy** (aho-corasick's packed searcher), and 5.5× faster than its own
-prefix ablation — same kernel, different sampled positions, so the win is
-attributable entirely to the optimizer.
+common case in IDS/log scanning and the structural blind spot of
+prefix-anchored filters: there SPARROW is **9× the reference Teddy**, and
+9× its own prefix-positions ablation — same kernel, so the win is entirely
+the position optimizer + empirical referee. On random patterns it beats
+Teddy by 29%; on match-heavy workloads (last row) filtering is irrelevant
+by construction and the automaton wins — the cost model predicts this.
+
+## Features
+
+- **Engines**: AVX-512BW (64-byte blocks, `VPTESTMB` extraction), AVX2,
+  and a bit-identical portable scalar fallback — runtime-detected,
+  monomorphized over configuration. The kernels use an offset-load
+  structure (no carry registers or cross-lane shifts; that's what lifts
+  the window from Teddy's 16 bytes to 32).
+- **Semantics**: all overlapping matches (`find_all`), leftmost
+  non-overlapping (`find_leftmost_nonoverlapping`, aho-corasick
+  leftmost-first compatible), streaming with cross-chunk matches
+  (`stream()`), ASCII case-insensitive mode, single-byte pattern wildcards
+  (`?`-globs).
+- **Verification**: per-entry guard probes (the model-rarest unsampled
+  pattern byte) reject most false candidates with one load.
 
 ## Usage
 
 ```rust
 use sparrow::Sparrow;
 
-let m = Sparrow::new(["GET /api/v1/users", "GET /api/v1/carts"]).unwrap();
+let m = Sparrow::builder()
+    .corpus_sample(traffic_sample)          // fit the model to your data
+    .ascii_case_insensitive(false)
+    .build(["GET /api/v1/users", "GET /api/v1/carts"]).unwrap();
+
 for hit in m.find_all(log_bytes) {
     println!("pattern {} at {}..{}", hit.pattern, hit.start, hit.end);
 }
+
+let mut s = m.stream();                     // streaming, global offsets
+for chunk in chunks { for hit in s.push(chunk) { /* … */ } }
 ```
 
-Tune with the builder: `corpus_sample(&sample)` fits the byte model to your
-traffic, `max_positions(k)` trades filter ops for selectivity,
-`positions(&[0,1,2,3])` forces Teddy-style sampling (ablation),
-`exhaustive_search(true)` widens the position search.
-
-`find_all` reports **all** overlapping occurrences of all patterns, sorted;
-an AVX2 kernel is selected at runtime with a bit-identical portable scalar
-fallback.
+Other knobs: `max_positions(k)`, `wildcard_byte(Some(b'?'))`,
+`positions(&[0,1,2,3])` (Teddy-style ablation), `corpus_scoring(false)`
+(pure closed-form selection), `exhaustive_search(true)`,
+`force_engine(Engine::Avx2)`.
 
 ## Repo layout
 
-- `src/builder.rs` — the offline optimizer (byte model, closure-exact
-  incremental cost, position search, greedy + local-search bucketing)
-- `src/avx2.rs`, `src/scalar.rs` — runtime engines
-- `docs/DESIGN.md` — survey, algorithm spec, theorems and proofs, honest
-  novelty analysis, benchmark details
-- `tests/correctness.rs` — differential fuzzing vs a brute-force oracle and
-  vs `aho-corasick`, boundary/adversarial cases
+- `src/builder.rs` — the offline optimizer (byte classes, closure-exact
+  objective, position search, greedy + local-search bucketing, plane and
+  cohort arbitration, empirical referee, guard selection)
+- `src/avx2.rs`, `src/avx512.rs`, `src/scalar.rs` — runtime engines
+- `docs/DESIGN.md` — survey, algorithm spec, theorems and proofs, novelty
+  analysis, benchmark details
+- `tests/correctness.rs` — differential fuzzing vs a brute-force oracle
+  and vs `aho-corasick`, across all engines and semantics
 - `examples/bench.rs` — the benchmark harness (`cargo run --release
   --example bench`)

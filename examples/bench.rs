@@ -1,6 +1,6 @@
-//! Benchmark harness: SPARROW vs aho-corasick (DFA, overlapping) and
-//! aho-corasick's packed Teddy searcher, plus the SPARROW prefix-positions
-//! ablation (Teddy-style contiguous sampling inside the same runtime).
+//! Benchmark harness: SPARROW (AVX-512 / AVX2 kernels, plus the
+//! prefix-positions ablation = Teddy-style contiguous sampling inside the
+//! same runtime) vs aho-corasick's DFA (overlapping) and packed Teddy.
 //!
 //! Run: cargo run --release --example bench
 //!
@@ -9,7 +9,7 @@
 //! differ; it is included as a throughput reference only.
 
 use aho_corasick::{AhoCorasick, AhoCorasickKind};
-use sparrow::Builder;
+use sparrow::{Builder, Engine};
 use std::time::Instant;
 
 struct Rng(u64);
@@ -51,16 +51,20 @@ fn run_workload(name: &str, patterns: &[Vec<u8>], hay: &[u8], corpus: &[u8]) {
         hay.len() / MB
     );
 
-    let sp = Builder::new().corpus_sample(corpus).build(patterns).unwrap();
+    let base = || Builder::new().corpus_sample(corpus);
+    let sp512 = base().force_engine(Engine::Avx512).build(patterns).ok();
+    let sp2 = base().force_engine(Engine::Avx2).build(patterns).unwrap();
     let sp_prefix = {
         let w = patterns.iter().map(|p| p.len()).min().unwrap().min(4) as u8;
         let pos: Vec<u8> = (0..w).collect();
-        Builder::new().corpus_sample(corpus).positions(&pos).build(patterns).unwrap()
+        base().positions(&pos).build(patterns).unwrap()
     };
     println!(
-        "sparrow positions: {:?} (model cost {:.3e}/byte) | prefix ablation cost {:.3e}/byte",
-        sp.sampled_positions(),
-        sp.expected_cost(),
+        "sparrow: positions {:?}, buckets {:?}, cohorts {}, model cost {:.3e}/byte | prefix ablation {:.3e}/byte",
+        sp2.sampled_positions(),
+        sp2.bucket_counts(),
+        sp2.cohort_count(),
+        sp2.expected_cost(),
         sp_prefix.expected_cost()
     );
 
@@ -68,15 +72,18 @@ fn run_workload(name: &str, patterns: &[Vec<u8>], hay: &[u8], corpus: &[u8]) {
         .kind(Some(AhoCorasickKind::DFA))
         .build(patterns)
         .unwrap();
-    let packed = aho_corasick::packed::Config::new()
-        .builder()
-        .extend(patterns)
-        .build();
+    let packed = aho_corasick::packed::Config::new().builder().extend(patterns).build();
 
     let gb = hay.len() as f64 / (1u64 << 30) as f64;
 
-    let (t, n_sp) = time_best_of(|| sp.find_all(hay).len());
-    println!("  sparrow (optimized)      {:8.3} GB/s   {} matches", gb / t, n_sp);
+    let mut n_512 = None;
+    if let Some(ref m) = sp512 {
+        let (t, n) = time_best_of(|| m.find_all(hay).len());
+        println!("  sparrow AVX-512          {:8.3} GB/s   {} matches", gb / t, n);
+        n_512 = Some(n);
+    }
+    let (t, n_sp) = time_best_of(|| sp2.find_all(hay).len());
+    println!("  sparrow AVX2             {:8.3} GB/s   {} matches", gb / t, n_sp);
     let (t, n_pre) = time_best_of(|| sp_prefix.find_all(hay).len());
     println!("  sparrow (prefix ablate)  {:8.3} GB/s   {} matches", gb / t, n_pre);
     let (t, n_ac) = time_best_of(|| ac_dfa.find_overlapping_iter(hay).count());
@@ -90,6 +97,9 @@ fn run_workload(name: &str, patterns: &[Vec<u8>], hay: &[u8], corpus: &[u8]) {
 
     assert_eq!(n_sp, n_pre, "both sparrow configs must agree");
     assert_eq!(n_sp, n_ac, "sparrow must agree with AC overlapping");
+    if let Some(n) = n_512 {
+        assert_eq!(n, n_sp, "AVX-512 and AVX2 engines must agree");
+    }
 }
 
 fn english_haystack(rng: &mut Rng) -> Vec<u8> {
@@ -114,7 +124,7 @@ fn english_haystack(rng: &mut Rng) -> Vec<u8> {
 fn main() {
     let mut rng = Rng(0x5EED);
 
-    // Workload 1: English words over English text (moderately rare hits).
+    // Workload 1: English words over English text (match-heavy).
     {
         let hay = english_haystack(&mut rng);
         let patterns: Vec<Vec<u8>> = [
@@ -150,7 +160,6 @@ fn main() {
         let mut hay = Vec::with_capacity(HAY_SIZE + 128);
         let mut i = 0usize;
         while hay.len() < HAY_SIZE {
-            // Near-misses: same 12-byte prefix, non-matching route.
             let line = format!(
                 "GET /api/v1/zz{:03}?p={} HTTP/1.1\nHost: svc-{}.internal\n",
                 i % 1000,
@@ -167,5 +176,24 @@ fn main() {
         }
         hay.truncate(HAY_SIZE);
         run_workload("shared-prefix API routes / near-miss log", &patterns, &hay, &hay[..64 * 1024]);
+    }
+
+    // Workload 4: mixed pattern lengths — 24 short common-looking words and
+    // 24 long rare signatures. Exercises the length-cohort arbitration
+    // (a single filter would be limited to the shortest pattern's window).
+    {
+        let hay = english_haystack(&mut rng);
+        let mut patterns: Vec<Vec<u8>> = [
+            "the", "and", "for", "was", "hall", "rain", "wing", "none", "over", "rose",
+            "east", "year", "build", "light", "early", "three", "lunch", "wrote",
+            "tuned", "moved", "hills", "vapor", "quill", "zesty",
+        ]
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+        for i in 0..24 {
+            patterns.push(format!("signature-block-{:04x}-terminal-marker", i * 2654435761u64 % 65536).into_bytes());
+        }
+        run_workload("mixed short words + long signatures", &patterns, &hay, &hay[..64 * 1024]);
     }
 }

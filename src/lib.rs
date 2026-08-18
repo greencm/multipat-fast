@@ -410,6 +410,43 @@ impl Sparrow {
     pub fn min_pattern_len(&self) -> usize {
         self.cohorts.iter().map(|c| c.min_len).min().unwrap()
     }
+
+    /// Heap/working-set footprint of the compiled matcher, by component.
+    pub fn memory_usage(&self) -> MemoryUsage {
+        let mut u = MemoryUsage::default();
+        for c in &self.cohorts {
+            // Nibble shuffle tables actually loaded by the SIMD kernels
+            // (the [MAX_PLANES][MAX_K] arrays are statically sized; count
+            // the entries the configuration uses).
+            u.filter_tables += 2 * c.planes * c.k * 16;
+            u.scalar_tables += c.byte_tbl.iter().map(|p| p.len() * 256).sum::<usize>();
+            u.buckets += c
+                .buckets
+                .iter()
+                .map(|b| b.len() * std::mem::size_of::<Entry>())
+                .sum::<usize>();
+        }
+        u.patterns = self
+            .patterns
+            .iter()
+            .map(|p| p.len() + std::mem::size_of::<Box<[u8]>>())
+            .sum();
+        u.total = u.filter_tables + u.scalar_tables + u.buckets + u.patterns;
+        u
+    }
+}
+
+/// Compiled-matcher footprint breakdown, in bytes. `filter_tables` is the
+/// SIMD-hot state (register-resident during scans); `scalar_tables` backs
+/// the prelude/tail path; `buckets` + `patterns` are touched only on
+/// candidates/matches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryUsage {
+    pub filter_tables: usize,
+    pub scalar_tables: usize,
+    pub buckets: usize,
+    pub patterns: usize,
+    pub total: usize,
 }
 
 /// Incremental scanner returned by [`Sparrow::stream`]. Feed chunks with

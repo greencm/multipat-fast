@@ -96,6 +96,11 @@ Other knobs: `max_positions(k)`, `wildcard_byte(Some(b'?'))`,
 - `src/avx2.rs`, `src/avx512.rs`, `src/scalar.rs` — runtime engines
 - `docs/DESIGN.md` — survey, algorithm spec, theorems and proofs, novelty
   analysis, benchmark details
+- `docs/CACHE.md` — working-set model, measured cache-residency sweeps and
+  cachegrind miss counts, and modern-CPU implications (the compiled filter
+  is 96–256 B and register-resident; the AC-DFA baseline takes one L1 miss
+  per ~6 bytes once its table exceeds L1)
+- `examples/cache_probe.rs` — footprint + cache-residency measurement tool
 - `tests/correctness.rs` — differential fuzzing vs a brute-force oracle
   and vs `aho-corasick`, across all engines and semantics
 - `examples/bench.rs` — the benchmark harness (`cargo run --release

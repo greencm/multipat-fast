@@ -52,8 +52,17 @@ fn run_workload(name: &str, patterns: &[Vec<u8>], hay: &[u8], corpus: &[u8]) {
     );
 
     let base = || Builder::new().corpus_sample(corpus);
-    let sp512 = base().force_engine(Engine::Avx512).build(patterns).ok();
-    let sp2 = base().force_engine(Engine::Avx2).build(patterns).unwrap();
+    // One matcher per SIMD engine this CPU supports (plus scalar if none).
+    let mut engines: Vec<(String, sparrow::Sparrow)> = Vec::new();
+    for e in [Engine::Avx512, Engine::Avx2, Engine::Neon] {
+        if let Ok(m) = base().force_engine(e).build(patterns) {
+            engines.push((format!("{:?}", e), m));
+        }
+    }
+    if engines.is_empty() {
+        engines.push(("Scalar".to_string(), base().build(patterns).unwrap()));
+    }
+    let sp2 = &engines.last().unwrap().1;
     let sp_prefix = {
         let w = patterns.iter().map(|p| p.len()).min().unwrap().min(4) as u8;
         let pos: Vec<u8> = (0..w).collect();
@@ -76,14 +85,16 @@ fn run_workload(name: &str, patterns: &[Vec<u8>], hay: &[u8], corpus: &[u8]) {
 
     let gb = hay.len() as f64 / (1u64 << 30) as f64;
 
-    let mut n_512 = None;
-    if let Some(ref m) = sp512 {
+    let mut n_sp: Option<usize> = None;
+    for (label, m) in &engines {
         let (t, n) = time_best_of(|| m.find_all(hay).len());
-        println!("  sparrow AVX-512          {:8.3} GB/s   {} matches", gb / t, n);
-        n_512 = Some(n);
+        println!("  sparrow {:16} {:8.3} GB/s   {} matches", label, gb / t, n);
+        if let Some(prev) = n_sp {
+            assert_eq!(n, prev, "all sparrow engines must agree");
+        }
+        n_sp = Some(n);
     }
-    let (t, n_sp) = time_best_of(|| sp2.find_all(hay).len());
-    println!("  sparrow AVX2             {:8.3} GB/s   {} matches", gb / t, n_sp);
+    let n_sp = n_sp.unwrap();
     let (t, n_pre) = time_best_of(|| sp_prefix.find_all(hay).len());
     println!("  sparrow (prefix ablate)  {:8.3} GB/s   {} matches", gb / t, n_pre);
     let (t, n_ac) = time_best_of(|| ac_dfa.find_overlapping_iter(hay).count());
@@ -97,9 +108,6 @@ fn run_workload(name: &str, patterns: &[Vec<u8>], hay: &[u8], corpus: &[u8]) {
 
     assert_eq!(n_sp, n_pre, "both sparrow configs must agree");
     assert_eq!(n_sp, n_ac, "sparrow must agree with AC overlapping");
-    if let Some(n) = n_512 {
-        assert_eq!(n, n_sp, "AVX-512 and AVX2 engines must agree");
-    }
 }
 
 fn english_haystack(rng: &mut Rng) -> Vec<u8> {

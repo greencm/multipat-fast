@@ -21,7 +21,7 @@ impl Rng {
     }
 }
 
-const ENGINES: &[Engine] = &[Engine::Scalar, Engine::Avx2, Engine::Avx512];
+const ENGINES: &[Engine] = &[Engine::Scalar, Engine::Avx2, Engine::Avx512, Engine::Neon];
 
 /// Build one matcher per available engine from the same builder config.
 fn build_engines<P: AsRef<[u8]> + Clone>(base: &Builder, patterns: &[P]) -> Vec<(Engine, Sparrow)> {

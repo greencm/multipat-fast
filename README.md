@@ -53,8 +53,9 @@ by construction and the automaton wins — the cost model predicts this.
 ## Features
 
 - **Engines**: AVX-512BW (64-byte blocks, `VPTESTMB` extraction), AVX2,
-  and a bit-identical portable scalar fallback — runtime-detected,
-  monomorphized over configuration. The kernels use an offset-load
+  ARM NEON (aarch64; `TBL` shuffles, SHRN-idiom extraction), and a
+  bit-identical portable scalar fallback — runtime-detected, monomorphized
+  over configuration. The kernels use an offset-load
   structure (no carry registers or cross-lane shifts; that's what lifts
   the window from Teddy's 16 bytes to 32).
 - **Semantics**: all overlapping matches (`find_all`), leftmost

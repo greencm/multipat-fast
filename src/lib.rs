@@ -35,6 +35,8 @@ mod scalar;
 mod avx2;
 #[cfg(target_arch = "x86_64")]
 mod avx512;
+#[cfg(target_arch = "aarch64")]
+mod neon;
 pub mod naive;
 
 use builder::{Compiled, Entry};
@@ -97,6 +99,7 @@ pub enum Engine {
     Scalar,
     Avx2,
     Avx512,
+    Neon,
 }
 
 /// Matching semantics shared by the filter compiler and the verifier.
@@ -246,7 +249,10 @@ fn engine_available(e: Engine) -> bool {
         Engine::Avx2 => std::arch::is_x86_feature_detected!("avx2"),
         #[cfg(target_arch = "x86_64")]
         Engine::Avx512 => std::arch::is_x86_feature_detected!("avx512bw"),
-        #[cfg(not(target_arch = "x86_64"))]
+        // NEON is baseline on aarch64.
+        #[cfg(target_arch = "aarch64")]
+        Engine::Neon => true,
+        #[allow(unreachable_patterns)]
         _ => false,
     }
 }
@@ -256,6 +262,8 @@ fn detect_engine() -> Engine {
         Engine::Avx512
     } else if engine_available(Engine::Avx2) {
         Engine::Avx2
+    } else if engine_available(Engine::Neon) {
+        Engine::Neon
     } else {
         Engine::Scalar
     }
@@ -317,6 +325,12 @@ impl Sparrow {
                 return;
             }
             _ => {}
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.engine == Engine::Neon && hay.len() >= 48 {
+            // SAFETY: NEON is baseline on aarch64.
+            unsafe { neon::find_all(ctx, hay, out) };
+            return;
         }
         scalar::find_in_range(ctx, hay, 0, hay.len(), out);
     }

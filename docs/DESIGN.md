@@ -321,7 +321,11 @@ its packed searcher is the reference Teddy implementation):
 * The scan-cost constants (`c₀`, `γ`) are calibrated for the benchmarked
   microarchitecture; a per-build microbenchmark could set them adaptively.
 * AVX-512 VBMI (`VPERMB`, 64-entry tables → 6-bit classes) would shrink
-  the closure inflation Lemma 1 quantifies; ARM NEON (`TBL` is a 16-byte
-  shuffle) is a near-mechanical port of the scalar/AVX2 pair.
+  the closure inflation Lemma 1 quantifies. An ARM NEON engine
+  (`src/neon.rs`: `TBL` shuffles on 16-byte blocks, SHRN-idiom candidate
+  extraction) is implemented and cross-compiled; it is validated by the
+  same differential test suite, which should be run once on real aarch64
+  hardware (`cargo test --release`) before trusting benchmark numbers
+  there.
 * Verification scans whole buckets; for very large rule sets a per-bucket
   hash or sorted-by-guard layout would sublinearize it.

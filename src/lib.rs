@@ -40,6 +40,8 @@ mod neon;
 pub mod naive;
 pub mod dense;
 pub mod pattern;
+#[cfg(feature = "prefilter")]
+pub mod prefilter;
 
 pub use pattern::{ByteSet, Pattern, PatternError};
 use pattern::Pat;

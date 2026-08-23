@@ -255,6 +255,20 @@ On the all-6-to-11-byte English set the model alone would pick dense
 (a 5% loss: it overestimates the sparse cost 2.7×); the timed referee
 measures 1.5 vs 1.1 ns/byte on the sample and keeps sparse-only.
 
+### 3.6 Regex literal prefilter
+
+`prefilter::Prefilter` (feature `prefilter`) is the Hyperscan-shaped
+integration the design was written for: `regex-syntax`'s prefix-literal
+extractor yields, for each regex, a finite set of literals such that
+every match begins with one of them; SPARROW matches the union (IDS-style
+rules share those prefixes pathologically — exactly workload 3); each
+candidate is confirmed by an anchored `regex-automata` search over the
+full haystack with a span, so look-behinds (`^`, `\b`) stay exact. The
+per-regex resume rule reproduces `find_iter` semantics exactly, and
+regexes with no usable prefix set (can match empty, infinite prefixes)
+run unfiltered — completeness for every accepted regex, no false
+negatives by construction.
+
 ## 4. Guarantees
 
 **Lemma 1 (closure exactness).** For every bucket `b` and position `j`, the

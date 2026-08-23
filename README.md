@@ -91,6 +91,13 @@ never beats a SIMD filter that touches every byte 16–64 at a time.
   parity with packed Teddy); streaming with cross-chunk matches
   (`stream()`), ASCII case-insensitive mode, single-byte pattern wildcards
   (`?`-globs).
+- **Regex prefilter** (`--features prefilter`): extract each regex's
+  required prefix literals (`regex-syntax`), SPARROW the union, confirm
+  candidates with anchored `regex-automata` searches. No false negatives;
+  regexes with no finite prefix set run unfiltered. On 50 IDS-style rules
+  sharing the `GET /api/v1/` prefix over the near-miss log: **5.5 GB/s**
+  vs 2.1 for regex-automata's own multi-regex engine (internal Teddy) and
+  0.25 for per-regex scans.
 - **Verification**: per-entry guard probes (the model-rarest unsampled
   pattern byte) reject most false candidates with one load.
 - **Dense lane (two-prong build)**: patterns no sampled-position filter
@@ -155,3 +162,5 @@ Other knobs: `max_positions(k)`, `wildcard_byte(Some(b'?'))`,
   --example bench`): SPARROW (two-prong, sparse-only, prefix ablation) vs
   aho-corasick DFA, packed Teddy, and a textbook Wu-Manber
 - `examples/dense_probe.rs` — dense-lane microbenchmark (scan vs hit cost)
+- `examples/regex_prefilter.rs` — the regex-prefilter benchmark
+  (`cargo run --release --features prefilter --example regex_prefilter`)

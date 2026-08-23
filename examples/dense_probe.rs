@@ -72,6 +72,41 @@ fn main() {
     let sparse = Builder::new().corpus_sample(&hay[..65536]).dense_lane(false).build(&words).unwrap();
     bench("16 words sparse-only / english", &sparse, &hay);
 
+    // Streaming: packet-sized chunks vs whole-buffer.
+    for chunk in [1500usize, 4096, 65536] {
+        let mut best = f64::INFINITY;
+        let mut n = 0usize;
+        for _ in 0..4 {
+            let t = Instant::now();
+            let mut s = two.stream();
+            n = hay.chunks(chunk).map(|c| s.push(c).len()).sum();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!(
+            "stream {chunk:6}-byte chunks             {:7.3} GB/s  {n} matches",
+            hay.len() as f64 / (1u64 << 30) as f64 / best
+        );
+    }
+
+    // Streaming a sparse-routed (filter-fast) set: here the old
+    // concat-copy per push was a real fraction of the work.
+    let routes: Vec<String> = (0..16).map(|i| format!("GET /api/v1/route{:02}", i)).collect();
+    let fast = Builder::new().corpus_sample(&hay[..65536]).build(&routes).unwrap();
+    for chunk in [1500usize, 65536] {
+        let mut best = f64::INFINITY;
+        for _ in 0..4 {
+            let t = Instant::now();
+            let mut s = fast.stream();
+            let n: usize = hay.chunks(chunk).map(|c| s.push(c).len()).sum();
+            std::hint::black_box(n);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!(
+            "stream sparse-fast {chunk:6}-byte chunks {:7.3} GB/s",
+            hay.len() as f64 / (1u64 << 30) as f64 / best
+        );
+    }
+
     // Ordering pass: natural engine output should be a few sorted runs.
     let mut v = two.find_all_unsorted(&hay);
     let t = Instant::now();

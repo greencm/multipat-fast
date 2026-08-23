@@ -120,6 +120,13 @@ a malloc + memcpy per chunk (~200–400 ns vs ~300 ns of scanning) — up to
 `lib.rs::StreamScanner`. Effort: S–M. **Verdict: do** — streaming is
 the IDS use case the README sells.
 
+*Status:* done. Chunk scanned in place; only `tail + max_len − 1` bytes
+are stitched and rescanned; the two sorted groups are merged, not
+re-sorted. Measured (16 MiB english, 16-word set): sparse-routed
+1500-byte chunks 3.0 → 6.3 GB/s, 64 KB 5.2 → 20.5; dense-routed 64 KB
+0.73 → 0.87; dense-routed 1500-byte chunks −10% (two scans vs one —
+accepted, documented on `StreamScanner::push`).
+
 ---
 
 ## 2. Model and optimizer

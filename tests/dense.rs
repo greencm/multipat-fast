@@ -301,3 +301,38 @@ fn scan_with_and_count_match_find_all() {
         }
     }
 }
+
+#[test]
+fn streaming_tiny_chunks_fuzz() {
+    let mut rng = Rng(0x57F);
+    for round in 0..40 {
+        let n = 300 + rng.below(3000);
+        let hay = english(&mut rng, n);
+        let p = pats(&["the", "and", "thethe", "a", "over", "orchestra"]);
+        let m = if round % 2 == 0 {
+            Builder::new().force_dense(true).build(&p).unwrap()
+        } else {
+            Builder::new().dense_lane(false).build(&p).unwrap()
+        };
+        let whole: Vec<(u64, u64, usize)> = m
+            .find_all(&hay)
+            .iter()
+            .map(|x| (x.start as u64, x.end as u64, x.pattern))
+            .collect();
+        let mut s = m.stream();
+        let mut got = Vec::new();
+        let mut off = 0;
+        while off < hay.len() {
+            // Chunk sizes 1..7 bytes: every boundary/stitch edge case.
+            let n = 1 + rng.below(7);
+            let end = (off + n).min(hay.len());
+            for sm in s.push(&hay[off..end]) {
+                got.push((sm.start, sm.end, sm.pattern));
+            }
+            off = end;
+        }
+        assert_eq!(got.len(), whole.len(), "round {round}");
+        got.sort_unstable();
+        assert_eq!(got, whole, "round {round}");
+    }
+}

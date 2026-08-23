@@ -21,8 +21,10 @@ use std::time::{Duration, Instant};
 pub const MAX_K: usize = 4;
 /// Buckets per plane: one per bit of a byte lane.
 pub const PLANE_BUCKETS: usize = 8;
-/// 1 plane = 8 buckets, 2 planes = 16 buckets.
-pub const MAX_PLANES: usize = 2;
+/// 1 plane = 8 buckets … 4 planes = 32 buckets. Each plane costs one
+/// shuffle pair + AND per sampled position per block; the cost model
+/// arbitrates whether the deeper bucketing pays for it.
+pub const MAX_PLANES: usize = 4;
 /// The anchor window. The offset-load kernels start SIMD blocks at offset
 /// 32, so any spread of positions within 32 bytes is loadable directly.
 pub const MAX_WINDOW: usize = 32;
@@ -560,7 +562,13 @@ fn compile_cohort(
     // Stage 2: for each finalist and each plane count, refine and score
     // under the selection model (empirical corpus scan if enabled, i.i.d.
     // closed form otherwise).
-    let plane_options: &[usize] = if n >= 32 { &[1, 2] } else { &[1] };
+    let plane_options: &[usize] = if n >= 128 {
+        &[1, 2, 4]
+    } else if n >= 32 {
+        &[1, 2]
+    } else {
+        &[1]
+    };
     let mut best: Option<(f64, Vec<u8>, usize, Assignment)> = None;
     for pos in &finalists {
         let classes = classes_for(pos);

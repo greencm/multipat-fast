@@ -666,7 +666,7 @@ impl Sparrow {
         self.cohorts.iter().map(|c| c.positions.clone()).collect()
     }
 
-    /// Buckets per cohort (8 or 16 = one or two SIMD planes).
+    /// Buckets per cohort (8, 16, or 32 = one, two, or four SIMD planes).
     pub fn bucket_counts(&self) -> Vec<usize> {
         self.cohorts.iter().map(|c| c.buckets.len()).collect()
     }

@@ -84,6 +84,10 @@ pub(crate) unsafe fn find_all(ctx: &ScanCtx<'_>, hay: &[u8], out: &mut Vec<Match
         (2, 2) => kernel::<2, 2>(ctx, hay, out),
         (3, 2) => kernel::<3, 2>(ctx, hay, out),
         (4, 2) => kernel::<4, 2>(ctx, hay, out),
-        _ => unreachable!("k in 1..=4, planes in 1..=2"),
+        (1, 4) => kernel::<1, 4>(ctx, hay, out),
+        (2, 4) => kernel::<2, 4>(ctx, hay, out),
+        (3, 4) => kernel::<3, 4>(ctx, hay, out),
+        (4, 4) => kernel::<4, 4>(ctx, hay, out),
+        _ => unreachable!("k in 1..=4, planes in 1|2|4"),
     }
 }

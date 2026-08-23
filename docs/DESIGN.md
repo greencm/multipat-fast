@@ -269,6 +269,15 @@ regexes with no usable prefix set (can match empty, infinite prefixes)
 run unfiltered — completeness for every accepted regex, no false
 negatives by construction.
 
+### 3.6b Four bucket planes
+
+`MAX_PLANES` is now 4 (32 buckets). Plane count stays cost-model
+arbitrated — {1}, {1,2}, or {1,2,4} are offered depending on set size —
+so small sets compile exactly as before; an 800-pattern set picks 32
+buckets and quarters its bucket occupancy for two extra shuffle pairs per
+position per block. The kernels are monomorphized over (k, planes) as
+before, with (k, 4) arms added.
+
 ### 3.7 Hashed verification
 
 A candidate bit used to cost a walk of its bucket. Above `HASH_MIN` (16)

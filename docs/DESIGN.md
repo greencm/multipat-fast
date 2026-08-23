@@ -191,21 +191,30 @@ Kernel facts that matter in practice, all measured rather than assumed:
 
 **Routing.** For each distinct pattern length `L` (≤ 32), "every pattern
 of length ≤ L" is offered to the dense lane (capacity permitting) and the
-rest compiled sparse as usual (with cohort arbitration). Total cost is
+rest compiled sparse as usual (with cohort arbitration); sparse-only is
+always a candidate. The model ranks candidates by
 `LANE_COST · lanes + MATCH_COST · r + Σ cohort costs`, where `r` is the
-dense lane's match rate *measured on the corpus sample* (the sparse cohorts
-already pay for true matches through their candidate term; the dense lane
-charges for them explicitly). The cheapest partition wins, the sparse-only
-build included. Shortest-first is the right family of partitions because
-short common patterns are what blind a filter and Shift-Or capacity is
-spent per pattern byte.
+dense lane's match rate *measured on the corpus sample*. The model is
+then only a shortlist: a **timed referee** scans the corpus sample (tiled
+to ≥ 256 KB, best of 3, ≤ 20 ms total) with the sparse-only baseline and
+the two best-ranked splits *exactly as built* — same kernels, same
+engine, same output path — and the fastest wins. This is §5.1's
+philosophy one level up: the sparse and dense cost scales never have to
+be calibrated against each other, and any future kernel change
+re-calibrates itself. The referee only runs when `corpus_scoring` is on,
+the sample is ≥ 16 KB and there is more than one candidate; otherwise
+(or with `timed_referee(false)`) the model decides. With the referee on,
+two builds can differ run-to-run only in which configuration they chose
+— never in the match set (Theorem 1 holds for every candidate).
+`Sparrow::routing_decision()` reports the candidates, their model costs,
+the measured ns/byte, and the choice.
 
 Measured (Apple M-series, 16 MiB): the mixed workload goes from 0.36 GB/s
 sparse-only to 0.75 two-prong (DFA 0.50); the sparse lane's window, no
 longer pinned by 3-byte words, moves from positions `[0,1,2]` to `[9]`.
-On the all-6-to-11-byte English set the router also picks dense, and the
-result is a tie (0.97 vs 1.02) — the sparse cost model overestimates
-itself there, an existing calibration issue the router inherits.
+On the all-6-to-11-byte English set the model alone would pick dense
+(a 5% loss: it overestimates the sparse cost 2.7×); the timed referee
+measures 1.5 vs 1.1 ns/byte on the sample and keeps sparse-only.
 
 ## 4. Guarantees
 
@@ -392,7 +401,6 @@ its packed searcher is the reference Teddy implementation):
   shift costs three ops, so the expected gain is ~20–30%, not 2×. Its
   capacity cap (4 lanes = 256 pattern bytes) is a model choice, not a
   kernel limit.
-* The sparse and dense cost scales are each calibrated against
-  measurements but not against *each other*; a per-build microbenchmark
-  referee (time both candidates on the corpus sample) would make routing
-  decisions empirical the way position selection already is.
+* The timed routing referee measures on the corpus *sample*; a sample
+  unlike the traffic mis-routes (never mis-matches). Position selection
+  inside a cohort is still model + candidate-count referee, not timed.

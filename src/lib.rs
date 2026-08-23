@@ -124,6 +124,7 @@ pub struct Builder {
     forced_engine: Option<Engine>,
     dense_lane: bool,
     force_dense: bool,
+    timed_referee: bool,
 }
 
 impl Default for Builder {
@@ -144,6 +145,7 @@ impl Builder {
             forced_engine: None,
             dense_lane: true,
             force_dense: false,
+            timed_referee: true,
         }
     }
 
@@ -223,6 +225,15 @@ impl Builder {
         self
     }
 
+    /// Decide dense-vs-sparse routing by *timing* the best model candidates
+    /// on the corpus sample (default on). Off = model cost alone, which
+    /// makes the routing choice deterministic across runs. Correctness is
+    /// identical either way; only throughput can differ.
+    pub fn timed_referee(mut self, on: bool) -> Builder {
+        self.timed_referee = on;
+        self
+    }
+
     /// Route every pattern to the dense lane if it fits (testing / probing).
     #[doc(hidden)]
     pub fn force_dense(mut self, on: bool) -> Builder {
@@ -250,7 +261,6 @@ impl Builder {
             corpus_score: self.corpus_score,
             match_opts: self.match_opts,
         };
-        let (cohorts, dense) = builder::build_routed(&pats, &opts, self.dense_lane, self.force_dense)?;
         let engine = match self.forced_engine {
             Some(e) => {
                 if !engine_available(e) {
@@ -260,8 +270,23 @@ impl Builder {
             }
             None => detect_engine(),
         };
+        let routing = builder::RoutingOpts {
+            dense_enabled: self.dense_lane,
+            force_dense: self.force_dense,
+            timed: self.timed_referee,
+            engine,
+        };
+        let (cohorts, dense, decision) = builder::build_routed(&pats, &opts, &routing)?;
         let max_len = pats.iter().map(|p| p.len()).max().unwrap();
-        Ok(Sparrow { patterns: pats, cohorts, dense, engine, match_opts: self.match_opts, max_len })
+        Ok(Sparrow {
+            patterns: pats,
+            cohorts,
+            dense,
+            engine,
+            match_opts: self.match_opts,
+            max_len,
+            decision,
+        })
     }
 }
 
@@ -300,6 +325,34 @@ pub struct Sparrow {
     engine: Engine,
     match_opts: MatchOpts,
     max_len: usize,
+    decision: RoutingDecision,
+}
+
+/// How the dense-vs-sparse routing was decided at build time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutingDecision {
+    /// `true` if the timed referee ran and chose; `false` if the model
+    /// cost alone decided (referee off, corpus too small, or only one
+    /// candidate).
+    pub timed: bool,
+    /// Every candidate partition the model considered, best model cost
+    /// first: (dense-lane pattern count, model cost/byte, measured ns/byte
+    /// if timed). Index 0 of `chosen` refers into this list.
+    pub candidates: Vec<RoutingCandidate>,
+    /// Index into `candidates` of the configuration that was built.
+    pub chosen: usize,
+}
+
+/// One routing candidate as seen by the referee.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutingCandidate {
+    /// Patterns routed to the dense lane (0 = sparse-only).
+    pub dense_patterns: usize,
+    /// Summed model cost per haystack byte.
+    pub model_cost: f64,
+    /// Best-of-N measured scan time on the tiled corpus, ns/byte; `None`
+    /// if this candidate was not timed.
+    pub measured_ns_per_byte: Option<f64>,
 }
 
 /// Everything a kernel needs to scan and verify for one cohort.
@@ -341,19 +394,48 @@ impl Sparrow {
     /// in [`find_all`](Self::find_all) can cost as much as the scan.
     pub fn find_all_unsorted(&self, haystack: &[u8]) -> Vec<Match> {
         let mut out = Vec::new();
-        for c in &self.cohorts {
-            let ctx = ScanCtx { c, patterns: &self.patterns, opts: self.match_opts };
-            self.scan_cohort(&ctx, haystack, &mut out);
-        }
-        if let Some(d) = &self.dense {
-            d.find_all(haystack, &mut out);
-        }
+        scan_all(
+            &self.cohorts,
+            self.dense.as_ref(),
+            &self.patterns,
+            self.engine,
+            self.match_opts,
+            haystack,
+            &mut out,
+        );
         out
     }
 
-    fn scan_cohort(&self, ctx: &ScanCtx<'_>, hay: &[u8], out: &mut Vec<Match>) {
+    /// How the dense/sparse split was decided at build time.
+    pub fn routing_decision(&self) -> &RoutingDecision {
+        &self.decision
+    }
+}
+
+/// Scan `hay` with a full configuration (sparse cohorts + optional dense
+/// lane). Shared by [`Sparrow::find_all_unsorted`] and the builder's timed
+/// routing referee, so the referee measures exactly what will run.
+pub(crate) fn scan_all(
+    cohorts: &[Compiled],
+    dense: Option<&DenseLane>,
+    patterns: &[Box<[u8]>],
+    engine: Engine,
+    opts: MatchOpts,
+    hay: &[u8],
+    out: &mut Vec<Match>,
+) {
+    for c in cohorts {
+        let ctx = ScanCtx { c, patterns, opts };
+        scan_cohort(engine, &ctx, hay, out);
+    }
+    if let Some(d) = dense {
+        d.find_all(hay, out);
+    }
+}
+
+fn scan_cohort(engine: Engine, ctx: &ScanCtx<'_>, hay: &[u8], out: &mut Vec<Match>) {
         #[cfg(target_arch = "x86_64")]
-        match self.engine {
+        match engine {
             Engine::Avx512 if hay.len() >= 96 => {
                 // SAFETY: gated on runtime AVX-512BW detection at build.
                 unsafe { avx512::find_all(ctx, hay, out) };
@@ -367,14 +449,15 @@ impl Sparrow {
             _ => {}
         }
         #[cfg(target_arch = "aarch64")]
-        if self.engine == Engine::Neon && hay.len() >= 48 {
+        if engine == Engine::Neon && hay.len() >= 48 {
             // SAFETY: NEON is baseline on aarch64.
             unsafe { neon::find_all(ctx, hay, out) };
             return;
         }
         scalar::find_in_range(ctx, hay, 0, hay.len(), out);
-    }
+}
 
+impl Sparrow {
     /// Leftmost, non-overlapping match semantics (like a lazy scan-and-skip
     /// or aho-corasick's leftmost-first): at each leftmost match start the
     /// earliest-built pattern wins, and scanning resumes past its end.

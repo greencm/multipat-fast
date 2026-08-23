@@ -13,7 +13,8 @@
 //! See `docs/DESIGN.md` for the theorems this implementation realizes.
 
 use crate::dense::{self, DenseLane};
-use crate::{BuildError, MatchOpts};
+use crate::{BuildError, Engine, Match, MatchOpts, RoutingCandidate, RoutingDecision};
+use std::time::{Duration, Instant};
 
 /// Maximum number of sampled positions (one shuffle pair per plane each).
 pub const MAX_K: usize = 4;
@@ -676,31 +677,69 @@ pub(crate) fn build(
     }
 }
 
+/// Routing controls passed from the [`crate::Builder`].
+pub(crate) struct RoutingOpts {
+    pub dense_enabled: bool,
+    pub force_dense: bool,
+    pub timed: bool,
+    pub engine: Engine,
+}
+
+/// Smallest corpus the timed referee will trust (below this, timing noise
+/// exceeds the model error it is meant to correct).
+const REFEREE_MIN_CORPUS: usize = 16 * 1024;
+/// The corpus is tiled up to this size so each timing covers enough bytes
+/// for page faults and warmup to amortize.
+const REFEREE_TILE: usize = 256 * 1024;
+/// Candidates timed (best model costs first).
+const REFEREE_TOP: usize = 3;
+/// Best-of-N repetitions per candidate.
+const REFEREE_REPS: usize = 3;
+/// Total wall-clock budget for the referee; once exceeded, remaining
+/// candidates keep their model cost only.
+const REFEREE_BUDGET: Duration = Duration::from_millis(20);
+
+type Candidate = (Vec<Compiled>, Option<DenseLane>, RoutingCandidate);
+
 /// Two-prong build: route a subset of patterns to the dense (Shift-Or)
-/// lane and the rest to sampled-position cohorts, choosing the partition
-/// with the lowest total model cost. Candidates are "every pattern of
-/// length <= L" for each distinct L: short, common patterns are what make
-/// a filter hopeless, and Shift-Or capacity is spent per pattern byte, so
-/// shortest-first is the natural ordering.
+/// lane and the rest to sampled-position cohorts. Candidates are "every
+/// pattern of length <= L" for each distinct L (short, common patterns
+/// are what make a filter hopeless, and Shift-Or capacity is spent per
+/// pattern byte, so shortest-first is the natural ordering), plus
+/// sparse-only. The model cost ranks them; the timed referee then scans
+/// the corpus sample with the top few *as built* and picks the fastest —
+/// the same philosophy as the position referee, one level up, so the
+/// sparse and dense cost scales never need to be calibrated against each
+/// other.
 pub(crate) fn build_routed(
     patterns: &[Box<[u8]>],
     opts: &BuildOpts,
-    dense_enabled: bool,
-    force_dense: bool,
-) -> Result<(Vec<Compiled>, Option<DenseLane>), BuildError> {
-    if force_dense {
+    routing: &RoutingOpts,
+) -> Result<(Vec<Compiled>, Option<DenseLane>, RoutingDecision), BuildError> {
+    let corpus = opts.corpus.unwrap_or(DEFAULT_CORPUS);
+    if routing.force_dense {
         let ids: Vec<u32> = (0..patterns.len() as u32).collect();
         if let Some(lane) = DenseLane::compile(&ids, patterns, &opts.match_opts, &[]) {
-            return Ok((Vec::new(), Some(lane)));
+            let cand = RoutingCandidate {
+                dense_patterns: patterns.len(),
+                model_cost: lane.expected_cost(),
+                measured_ns_per_byte: None,
+            };
+            let decision = RoutingDecision { timed: false, candidates: vec![cand], chosen: 0 };
+            return Ok((Vec::new(), Some(lane), decision));
         }
     }
     let sparse_only = build(patterns, opts)?;
-    if !dense_enabled || opts.forced_positions.is_some() {
-        return Ok((sparse_only, None));
+    let sparse_cost: f64 = sparse_only.iter().map(|c| c.expected_cost).sum();
+    let mut cands: Vec<Candidate> = vec![(
+        sparse_only,
+        None,
+        RoutingCandidate { dense_patterns: 0, model_cost: sparse_cost, measured_ns_per_byte: None },
+    )];
+    if !routing.dense_enabled || opts.forced_positions.is_some() {
+        let (c, d, r) = cands.pop().unwrap();
+        return Ok((c, d, RoutingDecision { timed: false, candidates: vec![r], chosen: 0 }));
     }
-    let corpus = opts.corpus.unwrap_or(DEFAULT_CORPUS);
-    let mut best_cost: f64 = sparse_only.iter().map(|c| c.expected_cost).sum();
-    let mut best: (Vec<Compiled>, Option<DenseLane>) = (sparse_only, None);
 
     let mut lens: Vec<usize> = patterns.iter().map(|p| p.len()).collect();
     lens.sort_unstable();
@@ -727,11 +766,67 @@ pub(crate) fn build_routed(
             let cost = cs.iter().map(|c| c.expected_cost).sum();
             (cs, cost)
         };
-        let total = cost + lane.expected_cost();
-        if total < best_cost {
-            best_cost = total;
-            best = (cohorts, Some(lane));
+        let model_cost = cost + lane.expected_cost();
+        cands.push((
+            cohorts,
+            Some(lane),
+            RoutingCandidate { dense_patterns: dense_ids.len(), model_cost, measured_ns_per_byte: None },
+        ));
+    }
+    // Model ranking (stable: ties keep sparse-only first).
+    cands.sort_by(|a, b| a.2.model_cost.partial_cmp(&b.2.model_cost).unwrap());
+
+    let can_time = routing.timed
+        && opts.corpus_score
+        && corpus.len() >= REFEREE_MIN_CORPUS
+        && cands.len() > 1;
+    let mut chosen = 0usize;
+    let mut timed = false;
+    if can_time {
+        // Tile the sample so one timing covers >= REFEREE_TILE bytes.
+        let reps = REFEREE_TILE.div_ceil(corpus.len()).max(1);
+        let mut hay = Vec::with_capacity(reps * corpus.len());
+        for _ in 0..reps {
+            hay.extend_from_slice(corpus);
+        }
+        let start = Instant::now();
+        let mut out: Vec<Match> = Vec::new();
+        let mut best_ns = f64::INFINITY;
+        // Always time the sparse-only baseline plus the best-ranked splits:
+        // the sparse model scale is the one most likely to be off.
+        let baseline = cands.iter().position(|c| c.2.dense_patterns == 0).unwrap();
+        let mut order: Vec<usize> = vec![baseline];
+        order.extend((0..cands.len()).filter(|&i| i != baseline).take(REFEREE_TOP - 1));
+        for (n, &i) in order.iter().enumerate() {
+            if n > 0 && start.elapsed() > REFEREE_BUDGET {
+                break;
+            }
+            let (cohorts, lane, rc) = &mut cands[i];
+            let mut best = f64::INFINITY;
+            for _ in 0..REFEREE_REPS {
+                out.clear();
+                let t = Instant::now();
+                crate::scan_all(
+                    cohorts,
+                    lane.as_ref(),
+                    patterns,
+                    routing.engine,
+                    opts.match_opts,
+                    &hay,
+                    &mut out,
+                );
+                out.sort();
+                best = best.min(t.elapsed().as_secs_f64() * 1e9 / hay.len() as f64);
+            }
+            rc.measured_ns_per_byte = Some(best);
+            if best < best_ns {
+                best_ns = best;
+                chosen = i;
+            }
+            timed = true;
         }
     }
-    Ok(best)
+    let report: Vec<RoutingCandidate> = cands.iter().map(|c| c.2.clone()).collect();
+    let (cohorts, lane, _) = cands.into_iter().nth(chosen).unwrap();
+    Ok((cohorts, lane, RoutingDecision { timed, candidates: report, chosen }))
 }

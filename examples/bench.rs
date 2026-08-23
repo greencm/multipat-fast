@@ -156,6 +156,23 @@ fn run_workload(name: &str, patterns: &[Vec<u8>], hay: &[u8], corpus: &[u8]) {
         ),
         None => println!("  dense lane: unused"),
     }
+    let d = sp2.routing_decision();
+    let cands: Vec<String> = d
+        .candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            format!(
+                "{}{}dense:{} model {:.2e}{}",
+                if i == d.chosen { "*" } else { "" },
+                if i == d.chosen { "" } else { " " },
+                c.dense_patterns,
+                c.model_cost,
+                c.measured_ns_per_byte.map_or(String::new(), |ns| format!(" meas {:.2}ns/B", ns))
+            )
+        })
+        .collect();
+    println!("  routing ({}): {}", if d.timed { "timed referee" } else { "model" }, cands.join(" | "));
 
     let ac_dfa = AhoCorasick::builder()
         .kind(Some(AhoCorasickKind::DFA))

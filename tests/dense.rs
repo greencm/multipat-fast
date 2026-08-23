@@ -199,7 +199,9 @@ fn router_splits_mixed_set_and_reports_it() {
     for i in 0..16 {
         p.push(format!("LONGSIGNATURE-{:02}-with-tail-bytes", i).into_bytes());
     }
-    let m = Builder::new().corpus_sample(&hay[..65536]).build(&p).unwrap();
+    // Pin the routing to the model so the assertions below are deterministic.
+    let m = Builder::new().corpus_sample(&hay[..65536]).timed_referee(false).build(&p).unwrap();
+    assert!(!m.routing_decision().timed);
     let d = m.dense_lane().expect("short common words should route dense");
     assert_eq!(d.pattern_count(), 16);
     assert!(d.max_len() <= 4);
@@ -223,4 +225,47 @@ fn fuzz_dense_small_alphabet() {
         let hay: Vec<u8> = (0..n).map(|_| b'a' + rng.below(alpha) as u8).collect();
         check(&p, &hay);
     }
+}
+
+#[test]
+fn timed_referee_reports_measurements_and_is_correct() {
+    let mut rng = Rng(33);
+    let hay = english(&mut rng, 1 << 20);
+    let mut p = pats(&["the", "and", "for", "was", "hall", "rain", "wing", "none", "over", "rose"]);
+    for i in 0..8 {
+        p.push(format!("LONGSIGNATURE-{:02}-with-tail-bytes", i).into_bytes());
+    }
+    let m = Builder::new().corpus_sample(&hay[..65536]).build(&p).unwrap();
+    let d = m.routing_decision();
+    assert!(d.timed, "64 KB corpus with several candidates must be timed");
+    assert!(d.candidates.len() >= 2);
+    let timed: Vec<_> = d.candidates.iter().filter(|c| c.measured_ns_per_byte.is_some()).collect();
+    assert!(timed.len() >= 2, "baseline plus at least one split must be timed");
+    assert!(d.candidates.iter().any(|c| c.dense_patterns == 0 && c.measured_ns_per_byte.is_some()));
+    assert!(d.candidates[d.chosen].measured_ns_per_byte.is_some());
+    let best = timed.iter().map(|c| c.measured_ns_per_byte.unwrap()).fold(f64::INFINITY, f64::min);
+    assert_eq!(d.candidates[d.chosen].measured_ns_per_byte.unwrap(), best);
+    assert_eq!(m.find_all(&hay), naive::find_all(&p, &hay));
+
+    // Too-small corpus: model decides, nothing is timed.
+    let m2 = Builder::new().corpus_sample(&hay[..4096]).build(&p).unwrap();
+    assert!(!m2.routing_decision().timed);
+    assert!(m2.routing_decision().candidates.iter().all(|c| c.measured_ns_per_byte.is_none()));
+    assert_eq!(m2.find_all(&hay), naive::find_all(&p, &hay));
+
+    // Referee off: model decides.
+    let m3 = Builder::new().corpus_sample(&hay[..65536]).timed_referee(false).build(&p).unwrap();
+    assert!(!m3.routing_decision().timed);
+    assert_eq!(m3.routing_decision().chosen, 0, "model ranking puts its best first");
+}
+
+#[test]
+fn build_time_with_referee_is_bounded() {
+    let mut rng = Rng(44);
+    let hay = english(&mut rng, 1 << 18);
+    let p = pats(&["the", "and", "for", "orchard", "cluster", "harvest", "orchestra", "over"]);
+    let t = std::time::Instant::now();
+    let _ = Builder::new().corpus_sample(&hay[..65536]).build(&p).unwrap();
+    let dt = t.elapsed();
+    assert!(dt.as_millis() < 500, "build took {:?}", dt);
 }

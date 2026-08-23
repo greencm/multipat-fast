@@ -48,7 +48,7 @@ build (§ dense lane below):
 
 | Workload | SPARROW two-prong | SPARROW sparse-only | Teddy (packed) | AC DFA | Wu-Manber (B=3) |
 |---|---|---|---|---|---|
-| English words / English text | 0.97 GB/s | 1.02 | 0.96 | 0.48 | 0.49 |
+| English words / English text | 1.03 GB/s | 1.02 | 0.96 | 0.48 | 0.49 |
 | 64 random len-8 / random bytes | **4.5 GB/s** | 4.5 | 4.5 | 0.51 | 0.83 |
 | shared-prefix routes / near-miss log | **9.0 GB/s** | 9.0 | 1.2 | 2.4 | 1.8 |
 | short words + long signatures (match-heavy) | **0.75 GB/s** | 0.36 | 0.43 | 0.50 | 0.37 |
@@ -88,10 +88,12 @@ never beats a SIMD filter that touches every byte 16–64 at a time.
   64-bit lanes, one bit per pattern byte, up to 4 lanes; four haystack
   segments scanned in lock-step so the shift/or chain never stalls; hits
   recorded branch-free and decoded out of the loop). The rest stay sparse.
-  The split is adopted only when its summed model cost — lanes plus the
-  match rate observed on the corpus sample — beats the sparse-only build.
-  `dense_lane(false)` disables it; `find_all_unsorted` skips the final
-  run-merge when order doesn't matter.
+  The model shortlists partitions; a timed referee then scans the corpus
+  sample with the sparse-only baseline and the best splits as built and
+  keeps the fastest (`routing_decision()` reports what it saw).
+  `dense_lane(false)` disables the lane, `timed_referee(false)` makes the
+  model decide alone (deterministic routing); `find_all_unsorted` skips
+  the final run-merge when order doesn't matter.
 
 ## Usage
 
@@ -114,7 +116,7 @@ for chunk in chunks { for hit in s.push(chunk) { /* … */ } }
 Other knobs: `max_positions(k)`, `wildcard_byte(Some(b'?'))`,
 `positions(&[0,1,2,3])` (Teddy-style ablation), `corpus_scoring(false)`
 (pure closed-form selection), `exhaustive_search(true)`,
-`force_engine(Engine::Avx2)`.
+`force_engine(Engine::Avx2)`, `dense_lane(false)`, `timed_referee(false)`.
 
 ## Repo layout
 

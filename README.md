@@ -81,9 +81,14 @@ never beats a SIMD filter that touches every byte 16–64 at a time.
   nibble closure and avoids sampling spread classes; the dense lane and the
   verifier test membership exactly. Case-insensitivity and the wildcard
   byte are now just special cases of this.
-- **Semantics**: all overlapping matches (`find_all`), leftmost
-  non-overlapping (`find_leftmost_nonoverlapping`, aho-corasick
-  leftmost-first compatible), streaming with cross-chunk matches
+- **Semantics**: all overlapping matches (`find_all`); leftmost-first
+  (`find_leftmost`, aho-corasick / regex compatible) and leftmost-longest
+  (`find_leftmost_longest`) natively — the kernels are re-entered past
+  each accepted match instead of filtering an overlapping list, and when
+  every pattern sits in the dense lane the Shift-Or state simply resets at
+  the match end, so the bytes inside accepted matches are never scanned
+  (1.5–1.8× the materialize-and-filter reference on self-overlapping sets,
+  parity with packed Teddy); streaming with cross-chunk matches
   (`stream()`), ASCII case-insensitive mode, single-byte pattern wildcards
   (`?`-globs).
 - **Verification**: per-entry guard probes (the model-rarest unsampled

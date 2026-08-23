@@ -64,6 +64,11 @@ struct Lane {
     keep: u64,
     /// Indexed by end-bit position: (pattern id, pattern length).
     end_info: Vec<(u32, u32)>,
+    /// deep[d]: the bits whose position within their pattern is >= d
+    /// (d in 0..=MAX_PATTERN_LEN). A live (clear) state bit in deep[d] at
+    /// haystack offset i is a partial match that started at or before
+    /// i - d. Used by the leftmost kernel's bounded lookahead.
+    deep: Box<[u64; MAX_PATTERN_LEN + 1]>,
 }
 
 pub struct DenseLane {
@@ -113,11 +118,15 @@ impl DenseLane {
             let mut ends = 0u64;
             let mut keep = u64::MAX;
             let mut end_info = vec![(0u32, 0u32); LANE_BITS];
+            let mut deep = Box::new([0u64; MAX_PATTERN_LEN + 1]);
             let mut off = 0usize;
             for &id in &members {
                 let p = &patterns[id as usize];
                 for (j, set) in p.sets.iter().enumerate() {
                     let bit = 1u64 << (off + j);
+                    for d in 0..=j {
+                        deep[d] |= bit;
+                    }
                     for c in 0..256usize {
                         if set.contains(c as u8) {
                             table[c] &= !bit;
@@ -130,7 +139,7 @@ impl DenseLane {
                 end_info[end] = (id, p.len() as u32);
                 off += p.len();
             }
-            out.push(Lane { table, ends, keep, end_info });
+            out.push(Lane { table, ends, keep, end_info, deep });
         }
         let lens = ids.iter().map(|&i| patterns[i as usize].len());
         let mut d = DenseLane {
@@ -171,6 +180,73 @@ impl DenseLane {
     /// Bytes of table state touched per byte scanned.
     pub fn table_bytes(&self) -> usize {
         self.lanes.len() * 256 * 8
+    }
+
+    /// Leftmost non-overlapping matches (`longest` selects leftmost-longest,
+    /// else leftmost-first), appended to `out`, resuming at each accepted
+    /// match's end. Single chain per lane: Shift-Or's all-ones state at
+    /// offset `e` means exactly "no partial match started before `e`", so
+    /// the resume is a state reset, and the bytes inside an accepted match
+    /// are never scanned. A completed match is held while any live partial
+    /// match started at or before it (bounded by `max_len` bytes of
+    /// lookahead); a later completion with an earlier start, or the same
+    /// start and a better pattern under the semantics, replaces it.
+    pub fn find_leftmost(&self, hay: &[u8], longest: bool, out: &mut Vec<Match>) {
+        let nl = self.lanes.len();
+        let mut st = [u64::MAX; MAX_LANES];
+        let mut i = 0usize;
+        let n = hay.len();
+        // Pending best: (start, end, pattern).
+        let mut pend: Option<(usize, usize, usize)> = None;
+        while i < n {
+            let c = hay[i] as usize;
+            let mut any = 0u64;
+            for l in 0..nl {
+                let ln = &self.lanes[l];
+                let s = ((st[l] << 1) & ln.keep) | ln.table[c];
+                st[l] = s;
+                any |= !s & ln.ends;
+            }
+            if any != 0 {
+                for l in 0..nl {
+                    let ln = &self.lanes[l];
+                    let mut hits = !st[l] & ln.ends;
+                    while hits != 0 {
+                        let bit = hits.trailing_zeros() as usize;
+                        hits &= hits - 1;
+                        let (id, len) = ln.end_info[bit];
+                        let (start, end, id) = (i + 1 - len as usize, i + 1, id as usize);
+                        let better = match pend {
+                            None => true,
+                            Some((ps, pe, pid)) => {
+                                start < ps
+                                    || (start == ps
+                                        && if longest { end > pe || (end == pe && id < pid) } else { id < pid })
+                            }
+                        };
+                        if better {
+                            pend = Some((start, end, id));
+                        }
+                    }
+                }
+            }
+            i += 1;
+            if let Some((ps, pe, pid)) = pend {
+                // Any live partial that started at or before ps? Its
+                // position within its pattern at offset i-1 is >= i-1-ps.
+                let d = (i - 1 - ps).min(MAX_PATTERN_LEN);
+                let mut live = 0u64;
+                for l in 0..nl {
+                    live |= !st[l] & self.lanes[l].deep[d] & self.lanes[l].deep[0];
+                }
+                if live == 0 || i >= n {
+                    out.push(Match { start: ps, end: pe, pattern: pid });
+                    pend = None;
+                    i = pe;
+                    st = [u64::MAX; MAX_LANES];
+                }
+            }
+        }
     }
 
     pub fn find_all(&self, hay: &[u8], out: &mut Vec<Match>) {

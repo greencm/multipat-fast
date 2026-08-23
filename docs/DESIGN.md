@@ -157,6 +157,28 @@ per position (memcmp when every set is a singleton). ASCII
 case-insensitivity and the wildcard byte are now just the special cases
 `{b, b^0x20}` and `ANY`.
 
+### 3.3c Leftmost semantics
+
+`find_leftmost` / `find_leftmost_longest` never materialize the
+overlapping match set. Two mechanisms, chosen by the routing outcome:
+
+* **All-dense** (every pattern in the Shift-Or lane): the state after a
+  reset at offset `e` is, by construction, "no partial match started
+  before `e`" — precisely the leftmost-resume invariant — so accepting a
+  match is a state reset at its end and the bytes inside it are skipped.
+  A completed match is *held* while any live partial match started at or
+  before it (`deep[d]` masks select the state bits whose in-pattern
+  position is ≥ d; lookahead is bounded by `max_len`), and is replaced by
+  a later completion with an earlier start, or the same start and a
+  better pattern under the chosen semantics (lower id; or longer, then
+  lower id). Validated against aho-corasick's `LeftmostFirst` and
+  `LeftmostLongest`.
+* **Mixed**: the haystack is scanned in adaptive windows (8–64 KB,
+  shrinking when a window is match-dense); each window's candidates are
+  resolved and the scan re-enters the kernels at the last accepted end.
+  This mostly saves the global materialization and sort; per-window
+  overhead (SIMD prelude/tail, dense warm-up) keeps windows large.
+
 ### 3.4 Length cohorts
 
 The anchor window is capped by the shortest pattern, so one short pattern

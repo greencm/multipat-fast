@@ -218,6 +218,28 @@ fn run_workload(name: &str, patterns: &[Vec<u8>], hay: &[u8], corpus: &[u8]) {
     assert_eq!(n_sp, n_pre, "both sparrow configs must agree");
     assert_eq!(n_sp, n_wm, "sparrow must agree with Wu-Manber");
     assert_eq!(n_sp, n_ac, "sparrow must agree with AC overlapping");
+
+    // Leftmost-first semantics: apples-to-apples with packed Teddy and the
+    // aho-corasick default (leftmost-first) DFA.
+    println!("  -- leftmost-first --");
+    let (t, n_lm) = time_best_of(|| sp2.find_leftmost(hay).len());
+    println!("  sparrow find_leftmost    {:8.3} GB/s   {} matches", gb / t, n_lm);
+    let (t, n_lr) = time_best_of(|| sp2.find_leftmost_nonoverlapping(hay).len());
+    println!("  sparrow (all+filter ref) {:8.3} GB/s   {} matches", gb / t, n_lr);
+    let ac_lf = AhoCorasick::builder()
+        .kind(Some(AhoCorasickKind::DFA))
+        .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+        .build(patterns)
+        .unwrap();
+    let (t, n_al) = time_best_of(|| ac_lf.find_iter(hay).count());
+    println!("  aho-corasick DFA (lmf)   {:8.3} GB/s   {} matches", gb / t, n_al);
+    if let Some(ref pk) = packed {
+        let (t, n_pk) = time_best_of(|| pk.find_iter(hay).count());
+        println!("  aho-corasick Teddy(pkd)  {:8.3} GB/s   {} matches", gb / t, n_pk);
+        assert_eq!(n_lm, n_pk, "sparrow leftmost must agree with Teddy");
+    }
+    assert_eq!(n_lm, n_lr, "native leftmost must agree with reference");
+    assert_eq!(n_lm, n_al, "sparrow leftmost must agree with AC leftmost-first");
 }
 
 fn english_haystack(rng: &mut Rng) -> Vec<u8> {

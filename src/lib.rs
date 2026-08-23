@@ -510,6 +510,9 @@ impl Sparrow {
     /// Leftmost, non-overlapping match semantics (like a lazy scan-and-skip
     /// or aho-corasick's leftmost-first): at each leftmost match start the
     /// earliest-built pattern wins, and scanning resumes past its end.
+    ///
+    /// Reference implementation: materializes every overlapping match and
+    /// filters. [`find_leftmost`](Self::find_leftmost) is the fast path.
     pub fn find_leftmost_nonoverlapping(&self, haystack: &[u8]) -> Vec<Match> {
         let all = self.find_all(haystack);
         let mut out = Vec::new();
@@ -532,6 +535,88 @@ impl Sparrow {
             }
             next_start = best.end;
             out.push(best);
+        }
+        out
+    }
+
+    /// Leftmost-first, non-overlapping matches (aho-corasick / regex
+    /// `LeftmostFirst` semantics: at each leftmost start the earliest-built
+    /// pattern wins; scanning resumes at its end). Same result as
+    /// [`find_leftmost_nonoverlapping`](Self::find_leftmost_nonoverlapping)
+    /// without materializing the overlapping matches: the haystack is
+    /// scanned in windows, re-entering the kernels at the end of each
+    /// accepted match, so on match-dense inputs most overlapping
+    /// occurrences are never verified, let alone sorted.
+    pub fn find_leftmost(&self, haystack: &[u8]) -> Vec<Match> {
+        self.leftmost(haystack, false)
+    }
+
+    /// Leftmost-longest, non-overlapping matches (POSIX-style: at each
+    /// leftmost start the longest pattern wins, ties to the earliest-built).
+    pub fn find_leftmost_longest(&self, haystack: &[u8]) -> Vec<Match> {
+        self.leftmost(haystack, true)
+    }
+
+    fn leftmost(&self, hay: &[u8], longest: bool) -> Vec<Match> {
+        const MIN_WIN: usize = 8 * 1024;
+        const MAX_WIN: usize = 64 * 1024;
+        let n = hay.len();
+        let mut out = Vec::new();
+        if self.cohorts.is_empty() {
+            // Everything is in the dense lane: its Shift-Or state resets
+            // at a match end, so leftmost is native and skips the bytes
+            // inside accepted matches.
+            if let Some(d) = &self.dense {
+                d.find_leftmost(hay, longest, &mut out);
+            }
+            return out;
+        }
+        let mut buf: Vec<Match> = Vec::new();
+        let mut pos = 0usize;
+        let mut win = 16 * 1024usize;
+        while pos < n {
+            // Accept starts in [pos, win_end); scan far enough that any
+            // pattern starting there is fully visible.
+            let win_end = (pos + win).min(n);
+            let scan_end = (win_end + self.max_len - 1).min(n);
+            buf.clear();
+            scan_all(&self.cohorts, self.dense.as_ref(), &self.patterns, self.engine, &hay[pos..scan_end], &mut buf);
+            let limit = win_end - pos;
+            buf.retain(|m| m.start < limit);
+            buf.sort_unstable();
+            let mut next = 0usize; // window-relative
+            let mut i = 0;
+            while i < buf.len() {
+                if buf[i].start < next {
+                    i += 1;
+                    continue;
+                }
+                let s = buf[i].start;
+                let mut best = buf[i];
+                while i < buf.len() && buf[i].start == s {
+                    let m = buf[i];
+                    let better = if longest {
+                        m.end > best.end || (m.end == best.end && m.pattern < best.pattern)
+                    } else {
+                        m.pattern < best.pattern
+                    };
+                    if better {
+                        best = m;
+                    }
+                    i += 1;
+                }
+                next = best.end;
+                out.push(Match { start: pos + best.start, end: pos + best.end, pattern: best.pattern });
+            }
+            // Resume past the last accepted match, or at the window end.
+            pos = (pos + next).max(win_end);
+            // Adapt: dense windows waste verification on discarded
+            // overlaps; sparse ones waste per-call prelude/tail work.
+            if buf.len() > 4096 {
+                win = (win / 2).max(MIN_WIN);
+            } else if buf.len() < 64 {
+                win = (win * 2).min(MAX_WIN);
+            }
         }
         out
     }

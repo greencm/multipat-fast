@@ -891,7 +891,10 @@ pub(crate) fn build_routed(
         let mut order: Vec<usize> = vec![baseline];
         order.extend((0..cands.len()).filter(|&i| i != baseline).take(REFEREE_TOP - 1));
         for (n, &i) in order.iter().enumerate() {
-            if n > 0 && start.elapsed() > REFEREE_BUDGET {
+            // The budget only trims candidates beyond the first two: a
+            // referee that timed nothing but the baseline decides nothing
+            // (seen in debug builds, where scans run ~20x slower).
+            if n > 1 && start.elapsed() > REFEREE_BUDGET {
                 break;
             }
             let (cohorts, lane, rc) = &mut cands[i];

@@ -102,6 +102,12 @@ elsewhere. Effort: S. **Verdict: do** (a) and (b) — the bench should also
 report a count-only number so engine comparisons stop including
 allocation.
 
+*Status:* (a) done — `scan_with`/`count_all` landed (W4 0.75 → 1.02 GB/s
+counting); the compact 8-byte internal run representation was implemented
+and measured a wash (±1% on W4/W1 across three runs — run-buffer store
+traffic is not the bottleneck; the event store and hit mispredicts are),
+so it was dropped. (c) done, see §1.8.
+
 ### 1.8 Streaming kernel without the tail copy
 `StreamScanner::push` concatenates `tail + chunk` into a fresh `Vec`
 every call — an allocation and a full copy per chunk, which for

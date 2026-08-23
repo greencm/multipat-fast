@@ -140,6 +140,23 @@ Greedy assignment inserts patterns in decreasing solo probability into the
 bucket with the smallest exact marginal `ΔT`; refinement keeps moving
 single patterns to strictly-better buckets until fixpoint.
 
+### 3.3b Byte-class patterns
+
+A pattern is a sequence of byte sets (`ByteSet`, 256-bit). The filter
+compiler maps each set to its nibble class `(Lo, Hi)` — the union of the
+members' low and high nibbles — and every probability in §3.3 is computed
+on the closure `Lo × Hi` exactly as before; Theorem 1 is unchanged
+because the closure of a set contains the set. What changes is the
+*cost*: a spread class like `[0-9A-Fa-f]` (22 bytes) closes to 48 bytes,
+`\w` (63 bytes) to 128, so the optimizer, which sees this through
+`closure_prob`, avoids sampling such positions whenever a sharper one is
+available — and when none is (every position a class), the router sends
+the pattern to the dense lane, whose `B[c]` table is built from exact
+membership and pays nothing for width. Verification is exact membership
+per position (memcmp when every set is a singleton). ASCII
+case-insensitivity and the wildcard byte are now just the special cases
+`{b, b^0x20}` and `ANY`.
+
 ### 3.4 Length cohorts
 
 The anchor window is capped by the shortest pattern, so one short pattern

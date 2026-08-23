@@ -39,6 +39,10 @@ mod avx512;
 mod neon;
 pub mod naive;
 pub mod dense;
+pub mod pattern;
+
+pub use pattern::{ByteSet, Pattern, PatternError};
+use pattern::Pat;
 
 use dense::DenseLane;
 
@@ -72,6 +76,8 @@ pub enum BuildError {
     NoPatterns,
     /// A pattern was the empty string.
     EmptyPattern,
+    /// A class pattern failed to parse (see [`PatternError`]).
+    BadPattern(PatternError),
     /// Explicitly forced sampled positions were empty, more than 4, or not
     /// strictly inside the common anchor window `[0, min(min_len, 32))`.
     BadPositions,
@@ -90,6 +96,7 @@ impl core::fmt::Display for BuildError {
             BuildError::EngineUnavailable => {
                 write!(f, "the forced engine is not supported on this CPU")
             }
+            BuildError::BadPattern(e) => write!(f, "bad pattern: {}", e),
         }
     }
 }
@@ -246,20 +253,68 @@ impl Builder {
         self
     }
 
+    /// Build from byte-string patterns, under the builder's semantics
+    /// (`ascii_case_insensitive`, `wildcard_byte`).
     pub fn build<I, P>(self, patterns: I) -> Result<Sparrow, BuildError>
     where
         I: IntoIterator<Item = P>,
         P: AsRef<[u8]>,
     {
-        let pats: Vec<Box<[u8]>> =
-            patterns.into_iter().map(|p| p.as_ref().to_vec().into_boxed_slice()).collect();
+        let o = self.match_opts;
+        let pats: Vec<Pattern> = patterns
+            .into_iter()
+            .map(|p| {
+                let mut pat = Pattern::new();
+                for &b in p.as_ref() {
+                    let set = if o.wildcard == Some(b) {
+                        ByteSet::ANY
+                    } else if o.case_insensitive {
+                        ByteSet::byte(b).ascii_case_fold()
+                    } else {
+                        ByteSet::byte(b)
+                    };
+                    pat.push(set);
+                }
+                pat
+            })
+            .collect();
+        self.build_patterns(pats)
+    }
+
+    /// Build from class-syntax strings (see [`Pattern::parse`]):
+    /// `Builder::new().build_parsed(["GET /api/v\d/", "[Hh]ost: "])`.
+    pub fn build_parsed<I, S>(self, patterns: I) -> Result<Sparrow, BuildError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut pats = Vec::new();
+        for p in patterns {
+            pats.push(Pattern::parse(p.as_ref()).map_err(BuildError::BadPattern)?);
+        }
+        self.build_patterns(pats)
+    }
+
+    /// Build from byte-class [`Pattern`]s. `ascii_case_insensitive` still
+    /// applies (each position is case-closed); `wildcard_byte` does not —
+    /// use [`ByteSet::ANY`].
+    pub fn build_patterns<I>(self, patterns: I) -> Result<Sparrow, BuildError>
+    where
+        I: IntoIterator<Item = Pattern>,
+    {
+        let pats: Vec<Pat> = patterns
+            .into_iter()
+            .map(|p| {
+                let p = if self.match_opts.case_insensitive { p.ascii_case_fold() } else { p };
+                Pat::from_pattern(&p)
+            })
+            .collect();
         let opts = builder::BuildOpts {
             corpus: self.corpus.as_deref(),
             max_k: self.max_positions.unwrap_or(builder::MAX_K),
             forced_positions: self.forced_positions.as_deref(),
             exhaustive: self.exhaustive,
             corpus_score: self.corpus_score,
-            match_opts: self.match_opts,
         };
         let engine = match self.forced_engine {
             Some(e) => {
@@ -277,16 +332,14 @@ impl Builder {
             engine,
         };
         let (cohorts, dense, decision) = builder::build_routed(&pats, &opts, &routing)?;
+        if pats.is_empty() {
+            return Err(BuildError::NoPatterns);
+        }
+        if pats.iter().any(|p| p.len() == 0) {
+            return Err(BuildError::EmptyPattern);
+        }
         let max_len = pats.iter().map(|p| p.len()).max().unwrap();
-        Ok(Sparrow {
-            patterns: pats,
-            cohorts,
-            dense,
-            engine,
-            match_opts: self.match_opts,
-            max_len,
-            decision,
-        })
+        Ok(Sparrow { patterns: pats, cohorts, dense, engine, max_len, decision })
     }
 }
 
@@ -319,11 +372,10 @@ fn detect_engine() -> Engine {
 
 /// A compiled multi-pattern matcher. Build once, search many haystacks.
 pub struct Sparrow {
-    patterns: Vec<Box<[u8]>>,
+    patterns: Vec<Pat>,
     cohorts: Vec<Compiled>,
     dense: Option<DenseLane>,
     engine: Engine,
-    match_opts: MatchOpts,
     max_len: usize,
     decision: RoutingDecision,
 }
@@ -358,8 +410,7 @@ pub struct RoutingCandidate {
 /// Everything a kernel needs to scan and verify for one cohort.
 pub(crate) struct ScanCtx<'a> {
     pub c: &'a Compiled,
-    pub patterns: &'a [Box<[u8]>],
-    pub opts: MatchOpts,
+    pub patterns: &'a [Pat],
 }
 
 impl Sparrow {
@@ -399,7 +450,6 @@ impl Sparrow {
             self.dense.as_ref(),
             &self.patterns,
             self.engine,
-            self.match_opts,
             haystack,
             &mut out,
         );
@@ -418,14 +468,13 @@ impl Sparrow {
 pub(crate) fn scan_all(
     cohorts: &[Compiled],
     dense: Option<&DenseLane>,
-    patterns: &[Box<[u8]>],
+    patterns: &[Pat],
     engine: Engine,
-    opts: MatchOpts,
     hay: &[u8],
     out: &mut Vec<Match>,
 ) {
     for c in cohorts {
-        let ctx = ScanCtx { c, patterns, opts };
+        let ctx = ScanCtx { c, patterns };
         scan_cohort(engine, &ctx, hay, out);
     }
     if let Some(d) = dense {
@@ -498,7 +547,7 @@ impl Sparrow {
     pub fn find_all_scalar(&self, haystack: &[u8]) -> Vec<Match> {
         let mut out = Vec::new();
         for c in &self.cohorts {
-            let ctx = ScanCtx { c, patterns: &self.patterns, opts: self.match_opts };
+            let ctx = ScanCtx { c, patterns: &self.patterns };
             scalar::find_in_range(&ctx, haystack, 0, haystack.len(), &mut out);
         }
         if let Some(d) = &self.dense {
@@ -584,7 +633,7 @@ impl Sparrow {
         u.patterns = self
             .patterns
             .iter()
-            .map(|p| p.len() + std::mem::size_of::<Box<[u8]>>())
+            .map(|p| p.len() * (1 + if p.exact { 0 } else { 32 }) + std::mem::size_of::<Pat>())
             .sum();
         u.total = u.filter_tables + u.scalar_tables + u.buckets + u.patterns;
         u
@@ -648,25 +697,11 @@ impl StreamScanner<'_> {
     }
 }
 
-/// True iff a haystack byte satisfies one pattern byte under the matcher's
-/// semantics (exact, ASCII-case-insensitive, or wildcard).
-#[inline(always)]
-pub(crate) fn byte_matches(hay_b: u8, pat_b: u8, opts: &MatchOpts) -> bool {
-    if opts.wildcard == Some(pat_b) {
-        return true;
-    }
-    if hay_b == pat_b {
-        return true;
-    }
-    opts.case_insensitive && hay_b.eq_ignore_ascii_case(&pat_b)
-}
-
+/// Exact membership test of a window against a pattern (memcmp for exact
+/// patterns, per-position set tests otherwise).
 #[inline]
-pub(crate) fn pattern_matches(window: &[u8], pat: &[u8], opts: &MatchOpts) -> bool {
-    if opts.wildcard.is_none() && !opts.case_insensitive {
-        return window == pat;
-    }
-    window.iter().zip(pat.iter()).all(|(&h, &p)| byte_matches(h, p, opts))
+pub(crate) fn pattern_matches(window: &[u8], pat: &Pat) -> bool {
+    pat.matches(window)
 }
 
 /// Exact verification of a candidate anchor for one bucket plane: check
@@ -689,18 +724,21 @@ pub(crate) fn verify_at(
     while mask != 0 {
         let b = mask.trailing_zeros() as usize;
         mask &= mask - 1;
-        for &Entry { id, guard_off, guard_byte } in &ctx.c.buckets[base + b] {
+        for &Entry { id, guard_off } in &ctx.c.buckets[base + b] {
             let p = &ctx.patterns[id as usize];
             let end = start + p.len();
             if end > hay.len() {
                 continue;
             }
-            // Guard probe: the model-rarest unsampled pattern byte. Rejects
-            // most false candidates with one load instead of a full compare.
-            if !byte_matches(hay[start + guard_off as usize], guard_byte, &ctx.opts) {
+            // Guard probe: the model-rarest unsampled pattern position.
+            // Rejects most false candidates with one load instead of a
+            // full compare.
+            let g = guard_off as usize;
+            let hb = hay[start + g];
+            if if p.exact { hb != p.bytes[g] } else { !p.sets[g].contains(hb) } {
                 continue;
             }
-            if pattern_matches(&hay[start..end], p, &ctx.opts) {
+            if pattern_matches(&hay[start..end], p) {
                 out.push(Match { start, end, pattern: id as usize });
             }
         }

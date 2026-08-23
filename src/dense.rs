@@ -15,7 +15,8 @@
 //! matcher holds up to `MAX_LANES` lanes. Anything bigger stays with the
 //! sampled-position filter (the router decides by model cost).
 
-use crate::{byte_matches, Match, MatchOpts};
+use crate::pattern::Pat;
+use crate::Match;
 
 /// Bits per lane.
 pub const LANE_BITS: usize = 64;
@@ -78,8 +79,7 @@ impl DenseLane {
     /// Pack `ids` into lanes (first-fit). `None` if they don't fit.
     pub(crate) fn compile(
         ids: &[u32],
-        patterns: &[Box<[u8]>],
-        opts: &MatchOpts,
+        patterns: &[Pat],
         corpus: &[u8],
     ) -> Option<DenseLane> {
         if ids.is_empty() {
@@ -116,10 +116,10 @@ impl DenseLane {
             let mut off = 0usize;
             for &id in &members {
                 let p = &patterns[id as usize];
-                for (j, &pb) in p.iter().enumerate() {
+                for (j, set) in p.sets.iter().enumerate() {
                     let bit = 1u64 << (off + j);
                     for c in 0..256usize {
-                        if byte_matches(c as u8, pb, opts) {
+                        if set.contains(c as u8) {
                             table[c] &= !bit;
                         }
                     }

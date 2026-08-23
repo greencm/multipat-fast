@@ -13,7 +13,8 @@
 //! See `docs/DESIGN.md` for the theorems this implementation realizes.
 
 use crate::dense::{self, DenseLane};
-use crate::{BuildError, Engine, Match, MatchOpts, RoutingCandidate, RoutingDecision};
+use crate::pattern::{ByteSet, Pat};
+use crate::{BuildError, Engine, Match, RoutingCandidate, RoutingDecision};
 use std::time::{Duration, Instant};
 
 /// Maximum number of sampled positions (one shuffle pair per plane each).
@@ -48,7 +49,6 @@ pub(crate) struct BuildOpts<'a> {
     pub forced_positions: Option<&'a [u8]>,
     pub exhaustive: bool,
     pub corpus_score: bool,
-    pub match_opts: MatchOpts,
 }
 
 /// One bucket entry: pattern id plus a precomputed guard probe — the
@@ -58,7 +58,6 @@ pub(crate) struct BuildOpts<'a> {
 pub(crate) struct Entry {
     pub id: u32,
     pub guard_off: u32,
-    pub guard_byte: u8,
 }
 
 /// A compiled filter for one length cohort.
@@ -110,27 +109,24 @@ them a wind that moved without purpose. 0123456789 aeiou AEIOU etaoin shrdlu
 the of and to in is was he for it with as his on be at by had not are but
 "#;
 
-/// The byte class a pattern presents at one position: sets of low and high
-/// nibbles. Exact bytes get singleton nibbles; ASCII case-insensitive
-/// letters contribute both cases; a wildcard byte contributes everything.
-/// The filter can only ever represent the nibble cross product, so the
-/// class *is* its (Lo, Hi) pair and probability math on it is exact.
+/// The byte class a pattern presents at one position to the *filter*: the
+/// sets of low and high nibbles of its byte set. The filter can only ever
+/// represent the nibble cross product (the closure), so the class *is* its
+/// (Lo, Hi) pair and probability math on it is exact. A spread class like
+/// `[0-9A-Fa-f]` closes to 3 x 16 = 48 bytes; the optimizer sees that
+/// through `closure_prob` and samples such positions only when it pays.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct Class {
     lo: u16,
     hi: u16,
 }
 
-pub(crate) fn class_of(byte: u8, opts: &MatchOpts) -> Class {
-    if opts.wildcard == Some(byte) {
-        return Class { lo: 0xFFFF, hi: 0xFFFF };
-    }
-    let mut lo = 1u16 << (byte & 15);
-    let mut hi = 1u16 << (byte >> 4);
-    if opts.case_insensitive && byte.is_ascii_alphabetic() {
-        let other = byte ^ 0x20;
-        lo |= 1 << (other & 15);
-        hi |= 1 << (other >> 4);
+pub(crate) fn class_of(set: &ByteSet) -> Class {
+    let mut lo = 0u16;
+    let mut hi = 0u16;
+    for b in set.iter() {
+        lo |= 1 << (b & 15);
+        hi |= 1 << (b >> 4);
     }
     Class { lo, hi }
 }
@@ -175,17 +171,13 @@ impl Model {
         p
     }
 
-    /// Model probability that a haystack byte satisfies `byte_matches`
-    /// against this pattern byte (used for guard selection).
-    fn match_prob(&self, byte: u8, opts: &MatchOpts) -> f64 {
-        if opts.wildcard == Some(byte) {
+    /// Model probability that a haystack byte is in the set (used for
+    /// guard selection).
+    fn match_prob(&self, set: &ByteSet) -> f64 {
+        if *set == ByteSet::ANY {
             return 1.0;
         }
-        let mut p = self.pi[byte as usize];
-        if opts.case_insensitive && byte.is_ascii_alphabetic() {
-            p += self.pi[(byte ^ 0x20) as usize];
-        }
-        p
+        set.iter().map(|b| self.pi[b as usize]).sum()
     }
 }
 
@@ -447,9 +439,9 @@ fn empirical_verif_cost(a: &Assignment, positions: &[u8], corpus: &[u8]) -> f64 
         .sum()
 }
 
-/// Pick the guard probe for one pattern: the model-rarest byte at an offset
-/// not already covered by the sampled positions (and not a wildcard).
-fn choose_guard(p: &[u8], positions: &[u8], opts: &MatchOpts, model: &Model) -> (u32, u8) {
+/// Pick the guard probe for one pattern: the model-rarest position not
+/// already covered by the sampled positions (and not match-anything).
+fn choose_guard(p: &Pat, positions: &[u8], model: &Model) -> u32 {
     let sampled: Vec<bool> = {
         let mut v = vec![false; p.len()];
         for &s in positions {
@@ -460,27 +452,24 @@ fn choose_guard(p: &[u8], positions: &[u8], opts: &MatchOpts, model: &Model) -> 
         v
     };
     let mut best: Option<(f64, usize)> = None;
-    for (off, &b) in p.iter().enumerate() {
-        if sampled[off] || opts.wildcard == Some(b) {
+    for (off, set) in p.sets.iter().enumerate() {
+        if sampled[off] || *set == ByteSet::ANY {
             continue;
         }
-        let prob = model.match_prob(b, opts);
+        let prob = model.match_prob(set);
         if best.map_or(true, |(bp, _)| prob < bp) {
             best = Some((prob, off));
         }
     }
-    match best {
-        Some((_, off)) => (off as u32, p[off]),
-        // Every byte is sampled or wildcard: guard on byte 0 (a wildcard
-        // guard byte always passes byte_matches, so this stays correct).
-        None => (0, p[0]),
-    }
+    // Every position is sampled or match-anything: guard on position 0
+    // (a guard that always passes stays correct, just useless).
+    best.map_or(0, |(_, off)| off as u32)
 }
 
 /// Compile one cohort: the given pattern ids share this filter.
 fn compile_cohort(
     ids: &[u32],
-    patterns: &[Box<[u8]>],
+    patterns: &[Pat],
     opts: &BuildOpts,
     model: &Model,
     corpus: &[u8],
@@ -490,7 +479,7 @@ fn compile_cohort(
     let max_k = opts.max_k.clamp(1, MAX_K);
     let min_len = ids.iter().map(|&i| patterns[i as usize].len()).min().unwrap();
     let w = min_len.min(MAX_WINDOW);
-    let class_at = |i: usize, s: usize| class_of(patterns[ids[i] as usize][s], &opts.match_opts);
+    let class_at = |i: usize, s: usize| class_of(&patterns[ids[i] as usize].sets[s]);
 
     let position_sets: Vec<Vec<u8>> = match opts.forced_positions {
         Some(ps) => {
@@ -585,9 +574,8 @@ fn compile_cohort(
                     }
                 }
             }
-            let (guard_off, guard_byte) =
-                choose_guard(&patterns[gid as usize], &positions, &opts.match_opts, model);
-            buckets[b].push(Entry { id: gid, guard_off, guard_byte });
+            let guard_off = choose_guard(&patterns[gid as usize], &positions, model);
+            buckets[b].push(Entry { id: gid, guard_off });
         }
     }
     let mut byte_tbl: Vec<Vec<[u8; 256]>> = vec![vec![[0u8; 256]; k]; planes];
@@ -623,13 +611,13 @@ fn compile_cohort(
 /// cost (each cohort scans the haystack once, and its scan term is part of
 /// its cost, so the comparison already charges for the extra passes).
 pub(crate) fn build(
-    patterns: &[Box<[u8]>],
+    patterns: &[Pat],
     opts: &BuildOpts,
 ) -> Result<Vec<Compiled>, BuildError> {
     if patterns.is_empty() {
         return Err(BuildError::NoPatterns);
     }
-    if patterns.iter().any(|p| p.is_empty()) {
+    if patterns.iter().any(|p| p.len() == 0) {
         return Err(BuildError::EmptyPattern);
     }
     let corpus = opts.corpus.unwrap_or(DEFAULT_CORPUS);
@@ -712,14 +700,14 @@ type Candidate = (Vec<Compiled>, Option<DenseLane>, RoutingCandidate);
 /// sparse and dense cost scales never need to be calibrated against each
 /// other.
 pub(crate) fn build_routed(
-    patterns: &[Box<[u8]>],
+    patterns: &[Pat],
     opts: &BuildOpts,
     routing: &RoutingOpts,
 ) -> Result<(Vec<Compiled>, Option<DenseLane>, RoutingDecision), BuildError> {
     let corpus = opts.corpus.unwrap_or(DEFAULT_CORPUS);
     if routing.force_dense {
         let ids: Vec<u32> = (0..patterns.len() as u32).collect();
-        if let Some(lane) = DenseLane::compile(&ids, patterns, &opts.match_opts, &[]) {
+        if let Some(lane) = DenseLane::compile(&ids, patterns, &[]) {
             let cand = RoutingCandidate {
                 dense_patterns: patterns.len(),
                 model_cost: lane.expected_cost(),
@@ -747,13 +735,13 @@ pub(crate) fn build_routed(
     for &l in lens.iter().filter(|&&l| l <= dense::MAX_PATTERN_LEN) {
         let (dense_ids, rest_ids): (Vec<u32>, Vec<u32>) =
             (0..patterns.len() as u32).partition(|&i| patterns[i as usize].len() <= l);
-        let Some(lane) = DenseLane::compile(&dense_ids, patterns, &opts.match_opts, corpus) else {
+        let Some(lane) = DenseLane::compile(&dense_ids, patterns, corpus) else {
             break; // longer thresholds only add patterns; none will fit either
         };
         let (cohorts, cost) = if rest_ids.is_empty() {
             (Vec::new(), 0.0)
         } else {
-            let subset: Vec<Box<[u8]>> =
+            let subset: Vec<Pat> =
                 rest_ids.iter().map(|&i| patterns[i as usize].clone()).collect();
             let mut cs = build(&subset, opts)?;
             for c in &mut cs {
@@ -811,7 +799,6 @@ pub(crate) fn build_routed(
                     lane.as_ref(),
                     patterns,
                     routing.engine,
-                    opts.match_opts,
                     &hay,
                     &mut out,
                 );

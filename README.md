@@ -75,6 +75,12 @@ never beats a SIMD filter that touches every byte 16–64 at a time.
   over configuration. The kernels use an offset-load
   structure (no carry registers or cross-lane shifts; that's what lifts
   the window from Teddy's 16 bytes to 32).
+- **Byte-class patterns**: a pattern is a sequence of byte *sets*
+  (`Pattern`/`ByteSet`, or the class syntax `build_parsed(["GET /api/v\d/",
+  "[^\x00-\x1f]"])`). The sampled-position filter prices a class by its
+  nibble closure and avoids sampling spread classes; the dense lane and the
+  verifier test membership exactly. Case-insensitivity and the wildcard
+  byte are now just special cases of this.
 - **Semantics**: all overlapping matches (`find_all`), leftmost
   non-overlapping (`find_leftmost_nonoverlapping`, aho-corasick
   leftmost-first compatible), streaming with cross-chunk matches
@@ -112,6 +118,10 @@ for hit in m.find_all(log_bytes) {
 let mut s = m.stream();                     // streaming, global offsets
 for chunk in chunks { for hit in s.push(chunk) { /* … */ } }
 ```
+
+Class patterns: `Sparrow::builder().build_parsed([r"Host: [a-z]+\.internal"])`
+is *not* a regex — `+` is a literal byte; use `build_parsed([r"v\d/users"])`
+for fixed-length classes, or build `Pattern`s from `ByteSet`s directly.
 
 Other knobs: `max_positions(k)`, `wildcard_byte(Some(b'?'))`,
 `positions(&[0,1,2,3])` (Teddy-style ablation), `corpus_scoring(false)`

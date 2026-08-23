@@ -42,6 +42,12 @@ const CANDIDATE_OVERHEAD: f64 = 6.0;
 const SCAN_COST_PER_TERM: f64 = 0.002;
 /// Bands smaller than this get merged into a neighboring length cohort.
 const MIN_COHORT: usize = 8;
+/// Buckets with at least this many fingerprintable entries get a hashed
+/// layout: entries sorted by an 8-bit fingerprint of their sampled bytes,
+/// with a 257-slot offset table, so a candidate verifies O(1 + collisions)
+/// entries instead of walking the bucket. Below this the walk is cheaper
+/// than the extra indirection.
+pub(crate) const HASH_MIN: usize = 16;
 
 pub(crate) struct BuildOpts<'a> {
     pub corpus: Option<&'a [u8]>,
@@ -60,6 +66,27 @@ pub(crate) struct Entry {
     pub guard_off: u32,
 }
 
+/// Fingerprint-indexed bucket region (see `HASH_MIN`). `entries` is sorted
+/// by fingerprint; `offsets[f]..offsets[f + 1]` is the run with
+/// fingerprint `f`. Only entries whose sampled positions are all exact
+/// bytes are fingerprintable; the rest stay in the bucket's scan tail.
+pub(crate) struct HashedBucket {
+    pub offsets: Box<[u32; 257]>,
+    pub entries: Vec<Entry>,
+}
+
+/// 8-bit fingerprint of the `k` sampled bytes (candidate side: the
+/// haystack bytes at the anchor; build side: the pattern bytes at the
+/// sampled offsets). Any mixing function works; it only has to agree.
+#[inline(always)]
+pub(crate) fn fingerprint(bytes: impl IntoIterator<Item = u8>) -> u8 {
+    let mut h: u32 = 0x9E37;
+    for b in bytes {
+        h = (h ^ b as u32).wrapping_mul(0x01000193);
+    }
+    (h ^ (h >> 8)) as u8
+}
+
 /// A compiled filter for one length cohort.
 pub struct Compiled {
     pub(crate) k: usize,
@@ -76,8 +103,13 @@ pub struct Compiled {
     /// byte -> bucket-bitmap tables (nibble closure precomposed) for the
     /// scalar engine; identical semantics to the SIMD path by construction.
     pub(crate) byte_tbl: Vec<Vec<[u8; 256]>>, // [plane][j]
-    /// Entries per bucket; bucket index = plane * 8 + bit.
+    /// Scan-tail entries per bucket; bucket index = plane * 8 + bit. For
+    /// small buckets this is the whole bucket; for hashed buckets it holds
+    /// only the entries that could not be fingerprinted (some sampled
+    /// position is a non-singleton byte set).
     pub(crate) buckets: Vec<Vec<Entry>>,
+    /// Fingerprint-indexed region per bucket (`None` below `HASH_MIN`).
+    pub(crate) hashed: Vec<Option<HashedBucket>>,
     pub(crate) min_len: usize,
     /// Total model cost per haystack byte (the minimized objective:
     /// verification + scan terms, under the selection model).
@@ -578,6 +610,45 @@ fn compile_cohort(
             buckets[b].push(Entry { id: gid, guard_off });
         }
     }
+    // Hashed layout for big buckets: move fingerprintable entries (all
+    // sampled positions are exact bytes) into a fingerprint-sorted region;
+    // non-exact entries stay in the scan tail.
+    let mut hashed: Vec<Option<HashedBucket>> = Vec::with_capacity(buckets.len());
+    for bkt in buckets.iter_mut() {
+        let fp_of = |e: &Entry| -> Option<u8> {
+            let p = &patterns[e.id as usize];
+            positions
+                .iter()
+                .map(|&s| p.sets[s as usize].is_singleton().then(|| p.bytes[s as usize]))
+                .collect::<Option<Vec<u8>>>()
+                .map(fingerprint)
+        };
+        let printable = bkt.iter().filter(|e| fp_of(e).is_some()).count();
+        if printable < HASH_MIN {
+            hashed.push(None);
+            continue;
+        }
+        let mut keyed: Vec<(u8, Entry)> = Vec::with_capacity(printable);
+        bkt.retain(|e| match fp_of(e) {
+            Some(f) => {
+                keyed.push((f, *e));
+                false
+            }
+            None => true,
+        });
+        keyed.sort_by_key(|(f, e)| (*f, e.id));
+        let mut offsets = Box::new([0u32; 257]);
+        for (f, _) in &keyed {
+            offsets[*f as usize + 1] += 1;
+        }
+        for f in 0..256 {
+            offsets[f + 1] += offsets[f];
+        }
+        hashed.push(Some(HashedBucket {
+            offsets,
+            entries: keyed.into_iter().map(|(_, e)| e).collect(),
+        }));
+    }
     let mut byte_tbl: Vec<Vec<[u8; 256]>> = vec![vec![[0u8; 256]; k]; planes];
     for plane in 0..planes {
         for j in 0..k {
@@ -600,6 +671,7 @@ fn compile_cohort(
         th,
         byte_tbl,
         buckets,
+        hashed,
         min_len,
         expected_cost,
         expected_candidates,
@@ -747,6 +819,11 @@ pub(crate) fn build_routed(
             for c in &mut cs {
                 for b in &mut c.buckets {
                     for e in b.iter_mut() {
+                        e.id = rest_ids[e.id as usize];
+                    }
+                }
+                for hb in c.hashed.iter_mut().flatten() {
+                    for e in hb.entries.iter_mut() {
                         e.id = rest_ids[e.id as usize];
                     }
                 }

@@ -713,6 +713,12 @@ impl Sparrow {
                 .iter()
                 .map(|b| b.len() * std::mem::size_of::<Entry>())
                 .sum::<usize>();
+            u.buckets += c
+                .hashed
+                .iter()
+                .flatten()
+                .map(|h| h.entries.len() * std::mem::size_of::<Entry>() + 257 * 4)
+                .sum::<usize>();
         }
         if let Some(d) = &self.dense {
             u.scalar_tables += d.table_bytes();
@@ -808,26 +814,52 @@ pub(crate) fn verify_at(
     // artifacts, not matches.
     let Some(start) = t.checked_sub(ctx.c.s_last) else { return };
     let base = plane * builder::PLANE_BUCKETS;
+    // Fingerprint of the sampled haystack bytes at this anchor, computed
+    // at most once per candidate and shared by every flagged bucket (the
+    // sampled offsets are cohort-wide). Cheap: the filter just read those
+    // k bytes, they are in cache.
+    let mut fp: Option<u8> = None;
     while mask != 0 {
         let b = mask.trailing_zeros() as usize;
         mask &= mask - 1;
-        for &Entry { id, guard_off } in &ctx.c.buckets[base + b] {
-            let p = &ctx.patterns[id as usize];
-            let end = start + p.len();
-            if end > hay.len() {
-                continue;
-            }
-            // Guard probe: the model-rarest unsampled pattern position.
-            // Rejects most false candidates with one load instead of a
-            // full compare.
-            let g = guard_off as usize;
-            let hb = hay[start + g];
-            if if p.exact { hb != p.bytes[g] } else { !p.sets[g].contains(hb) } {
-                continue;
-            }
-            if pattern_matches(&hay[start..end], p) {
-                out.push(Match { start, end, pattern: id as usize });
+        if let Some(hb) = &ctx.c.hashed[base + b] {
+            let f = *fp.get_or_insert_with(|| {
+                builder::fingerprint(ctx.c.d[..ctx.c.k].iter().map(|&d| hay[t - d]))
+            }) as usize;
+            let (lo, hi) = (hb.offsets[f] as usize, hb.offsets[f + 1] as usize);
+            for &Entry { id, guard_off } in &hb.entries[lo..hi] {
+                check_entry(ctx, hay, start, id, guard_off, out);
             }
         }
+        for &Entry { id, guard_off } in &ctx.c.buckets[base + b] {
+            check_entry(ctx, hay, start, id, guard_off, out);
+        }
+    }
+}
+
+/// Verify one bucket entry at `start`: bounds, guard probe (the
+/// model-rarest unsampled pattern position — rejects most false
+/// candidates with one load), then the full comparison.
+#[inline(always)]
+fn check_entry(
+    ctx: &ScanCtx<'_>,
+    hay: &[u8],
+    start: usize,
+    id: u32,
+    guard_off: u32,
+    out: &mut Vec<Match>,
+) {
+    let p = &ctx.patterns[id as usize];
+    let end = start + p.len();
+    if end > hay.len() {
+        return;
+    }
+    let g = guard_off as usize;
+    let hb = hay[start + g];
+    if if p.exact { hb != p.bytes[g] } else { !p.sets[g].contains(hb) } {
+        return;
+    }
+    if pattern_matches(&hay[start..end], p) {
+        out.push(Match { start, end, pattern: id as usize });
     }
 }

@@ -269,6 +269,21 @@ regexes with no usable prefix set (can match empty, infinite prefixes)
 run unfiltered — completeness for every accepted regex, no false
 negatives by construction.
 
+### 3.7 Hashed verification
+
+A candidate bit used to cost a walk of its bucket. Above `HASH_MIN` (16)
+entries, a bucket now stores its fingerprintable entries sorted by an
+8-bit fingerprint of the pattern bytes at the *sampled* positions, with a
+257-slot offset table; a candidate hashes the k sampled haystack bytes it
+already loaded and verifies only the matching run — O(1 + true
+collisions) instead of O(bucket). Entries whose sampled positions are not
+exact bytes (case pairs, classes, wildcards) stay in a scan tail that is
+always walked, so semantics are unchanged; a wholly case-insensitive
+build gets no speedup from this path. Small buckets keep the plain walk —
+the four 16–64-pattern benchmark workloads are bit-identical and within
+noise. This is the DFC/FDR "confirm" structure and is what moves the
+usable pattern-set size past Teddy's few hundred (§ROADMAP 3.3).
+
 ## 4. Guarantees
 
 **Lemma 1 (closure exactness).** For every bucket `b` and position `j`, the

@@ -370,6 +370,10 @@ streaming path. These also exercise §3 and §2.3, which currently have no
 evidence either way. Effort: M (licensing and loaders). **Verdict: do**
 — nothing in §2–3 should be decided without them.
 
+**Status:** Wikipedia done (`examples/wiki_bench.rs`, results in README —
+including an honest loss on 256 rare patterns that motivates §3). Snort
+rules and pcap corpora still open.
+
 ### 6.3 Hyperscan as a comparator
 Hyperscan (or Vectorscan on ARM) is the engine reviewers will name
 first; FDR + Teddy with a far better literal planner than aho-corasick's

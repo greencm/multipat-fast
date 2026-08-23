@@ -67,6 +67,35 @@ and the combination is 2.1× the sparse-only matcher and 1.5× the DFA.
 Wu-Manber skips bytes but verifies on every shared-prefix near-miss; it
 never beats a SIMD filter that touches every byte 16–64 at a time.
 
+### Real corpus: Simple English Wikipedia (aarch64, Apple M-series)
+
+30 MB of the `simplewiki` XML dump as haystack; pattern sets derived
+deterministically from a held-out half of the file (the builder's corpus
+sample is held out too — never the scanned region). Reproduce with
+`cargo run --release --example wiki_bench` (the example header has the
+two-line download recipe).
+
+| Pattern set | matches | SPARROW | sparse-only | Teddy (packed) | AC DFA |
+|---|---|---|---|---|---|
+| (a) 16 common words (match-dense) | 702 K | 1.07 GB/s | 1.08 | 0.92 | 0.51 |
+| (b) 64 mid-frequency words, len 6–12 | 16 K | **2.14** | 2.15 | 0.44 | 0.62 |
+| (c) 256 rare words, len 8–20 | 251 | 0.36 | 0.36 | n/a | **0.60** |
+| (d) 24 markup literals, shared prefixes | 122 K | **3.73** | 3.79 | 2.86 | 0.60 |
+| (e) 16 common short + 32 rare long | 709 K | **0.92** | 0.80 | 0.23 | 0.51 |
+| (a) leftmost-first | 702 K | **0.84** | — | — | 0.78 |
+| (d) leftmost-first | 122 K | **3.58** | — | — | 2.62 |
+
+Honest read: on real text SPARROW wins clearly where its design says it
+should — many patterns (b: 5× Teddy), shared prefixes (d: 1.3× Teddy, 6×
+the DFA), and the mixed set, where the timed referee routes the 16 short
+words dense and beats both its own sparse-only build (+15%) and every
+baseline. Match-dense common words (a) are a three-way tie with Teddy and
+sparse-only — the referee correctly declined the dense lane there. The
+loss is (c): 256 patterns split into two cohorts means two passes and a
+high candidate rate, and the DFA wins by 1.7× — exactly the scale
+weakness ROADMAP §3 (hashed verification, more planes) targets. Routing
+matched the fastest measured configuration on every set.
+
 ## Features
 
 - **Engines**: AVX-512BW (64-byte blocks, `VPTESTMB` extraction), AVX2,

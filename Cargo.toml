@@ -30,3 +30,7 @@ prefilter = ["dep:regex-syntax", "dep:regex-automata"]
 # Exhaustively enumerate every sampled-position subset instead of the pruned
 # top-scoring candidate set. Slower builds, identical guarantees.
 exhaustive-search = []
+
+[[example]]
+name = "regex_prefilter"
+required-features = ["prefilter"]

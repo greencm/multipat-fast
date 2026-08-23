@@ -336,3 +336,29 @@ fn streaming_tiny_chunks_fuzz() {
         assert_eq!(got, whole, "round {round}");
     }
 }
+
+#[test]
+fn neon_pair_kernel_matches_scalar() {
+    let mut rng = Rng(0x9E09);
+    for round in 0..60 {
+        let n = if round % 8 == 0 { 200_000 } else { 200 + rng.below(2000) };
+        let hay = english(&mut rng, n);
+        // 9..=20 patterns so two lanes engage; lengths 1..=12.
+        let np = 9 + rng.below(12);
+        let p: Vec<Vec<u8>> = (0..np)
+            .map(|_| {
+                let s = rng.below(hay.len().saturating_sub(13).max(1));
+                let l = 1 + rng.below(12);
+                hay[s..(s + l).min(hay.len())].to_vec()
+            })
+            .filter(|w| !w.is_empty())
+            .collect();
+        let fast = Builder::new().force_dense(true).build(&p).unwrap();
+        let slow = Builder::new().force_dense(true).dense_scalar_kernel(true).build(&p).unwrap();
+        if fast.dense_lane().is_none() {
+            continue;
+        }
+        assert_eq!(fast.find_all(&hay), slow.find_all(&hay), "round {round}");
+        assert_eq!(fast.count_all(&hay), slow.count_all(&hay), "round {round}");
+    }
+}

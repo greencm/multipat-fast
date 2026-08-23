@@ -134,6 +134,7 @@ pub struct Builder {
     dense_lane: bool,
     force_dense: bool,
     timed_referee: bool,
+    dense_scalar_kernel: bool,
 }
 
 impl Default for Builder {
@@ -154,6 +155,7 @@ impl Builder {
             forced_engine: None,
             dense_lane: true,
             force_dense: false,
+            dense_scalar_kernel: false,
             timed_referee: true,
         }
     }
@@ -250,6 +252,14 @@ impl Builder {
         self
     }
 
+    /// Force the scalar dense-lane pair kernel (testing: differential
+    /// check of the vector kernel).
+    #[doc(hidden)]
+    pub fn dense_scalar_kernel(mut self, on: bool) -> Builder {
+        self.dense_scalar_kernel = on;
+        self
+    }
+
     pub fn force_engine(mut self, engine: Engine) -> Builder {
         self.forced_engine = Some(engine);
         self
@@ -333,7 +343,10 @@ impl Builder {
             timed: self.timed_referee,
             engine,
         };
-        let (cohorts, dense, decision) = builder::build_routed(&pats, &opts, &routing)?;
+        let (cohorts, mut dense, decision) = builder::build_routed(&pats, &opts, &routing)?;
+        if let Some(d) = dense.as_mut() {
+            d.scalar_kernel = self.dense_scalar_kernel;
+        }
         if pats.is_empty() {
             return Err(BuildError::NoPatterns);
         }

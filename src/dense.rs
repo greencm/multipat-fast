@@ -73,6 +73,11 @@ struct Lane {
 
 pub struct DenseLane {
     lanes: Vec<Lane>,
+    /// Interleaved `[lane 2p, lane 2p+1]` tables so the NEON kernel loads
+    /// both lanes' rows with a single `vld1q` (4 KB per pair).
+    pair_tables: Vec<Box<[[u64; 2]; 256]>>,
+    /// Test knob: force the scalar lane-pair kernel even on aarch64.
+    pub(crate) scalar_kernel: bool,
     max_len: usize,
     min_len: usize,
     n_patterns: usize,
@@ -142,8 +147,20 @@ impl DenseLane {
             out.push(Lane { table, ends, keep, end_info, deep });
         }
         let lens = ids.iter().map(|&i| patterns[i as usize].len());
+        let mut pair_tables = Vec::new();
+        for pr in out.chunks(2) {
+            if let [a, b] = pr {
+                let mut t = Box::new([[0u64; 2]; 256]);
+                for c in 0..256 {
+                    t[c] = [a.table[c], b.table[c]];
+                }
+                pair_tables.push(t);
+            }
+        }
         let mut d = DenseLane {
             lanes: out,
+            pair_tables,
+            scalar_kernel: false,
             max_len: lens.clone().max().unwrap(),
             min_len: lens.min().unwrap(),
             n_patterns: ids.len(),
@@ -179,7 +196,7 @@ impl DenseLane {
     }
     /// Bytes of table state touched per byte scanned.
     pub fn table_bytes(&self) -> usize {
-        self.lanes.len() * 256 * 8
+        self.lanes.len() * 256 * 8 + self.pair_tables.len() * 256 * 16
     }
 
     /// Leftmost non-overlapping matches (`longest` selects leftmost-longest,
@@ -264,7 +281,7 @@ impl DenseLane {
             let mut l = 0;
             while l < self.lanes.len() {
                 if l + 2 <= self.lanes.len() {
-                    self.scan_chunk2(hay, off, end, l, &mut drain);
+                    self.scan_pair(hay, off, end, l, &mut drain);
                     l += 2;
                 } else {
                     self.scan_chunk1(hay, off, end, l, &mut drain);
@@ -292,7 +309,7 @@ impl DenseLane {
             let mut l = 0;
             while l < self.lanes.len() {
                 if l + 2 <= self.lanes.len() {
-                    self.scan_chunk2(hay, off, end, l, &mut runs);
+                    self.scan_pair(hay, off, end, l, &mut runs);
                     l += 2;
                 } else {
                     self.scan_chunk1(hay, off, end, l, &mut runs);
@@ -386,6 +403,119 @@ impl DenseLane {
         }
         let common = (0..SEGS).map(|g| stop[g] - pos[g]).min().unwrap();
         (pos, stop, report_from, common)
+    }
+
+    /// Two-lane dispatch: the NEON kernel packs the lane pair into one
+    /// vector register per segment (single table load per segment-step);
+    /// elsewhere, or when forced, the scalar pair kernel runs.
+    #[inline(always)]
+    fn scan_pair<D: Drain>(&self, hay: &[u8], lo: usize, hi: usize, l0: usize, runs: &mut D) {
+        #[cfg(target_arch = "aarch64")]
+        if !self.scalar_kernel {
+            // SAFETY: NEON is baseline on aarch64.
+            unsafe { self.scan_chunk2_neon(hay, lo, hi, l0, runs) };
+            return;
+        }
+        self.scan_chunk2(hay, lo, hi, l0, runs);
+    }
+
+    /// NEON lane-pair kernel: states are `uint64x2_t` (`vshlq_n_u64`
+    /// shifts both 64-bit lanes independently — patterns never straddle
+    /// lanes, so no carry exists), and one `vld1q` fetches both lanes'
+    /// table rows. Same segment layout, event buffer, and drain machinery
+    /// as [`scan_chunk2`](Self::scan_chunk2).
+    #[cfg(target_arch = "aarch64")]
+    #[inline(never)]
+    #[target_feature(enable = "neon")]
+    unsafe fn scan_chunk2_neon<D: Drain>(
+        &self,
+        hay: &[u8],
+        lo: usize,
+        hi: usize,
+        l0: usize,
+        runs: &mut D,
+    ) {
+        use core::arch::aarch64::*;
+        let (pos, stop, report_from, common) = self.segments(lo, hi);
+        let (la, lb) = (&self.lanes[l0], &self.lanes[l0 + 1]);
+        let pair: &[[u64; 2]; 256] = &self.pair_tables[l0 / 2];
+        let tp = pair.as_ptr() as *const u64;
+        let keep_v = unsafe { vld1q_u64([la.keep, lb.keep].as_ptr()) };
+        let ends_v = unsafe { vld1q_u64([la.ends, lb.ends].as_ptr()) };
+        let base = hay.as_ptr();
+        let (p0, p1, p2, p3) = unsafe {
+            (base.add(pos[0]), base.add(pos[1]), base.add(pos[2]), base.add(pos[3]))
+        };
+        let ones = unsafe { vdupq_n_u64(u64::MAX) };
+        let (mut s0, mut s1, mut s2, mut s3) = (ones, ones, ones, ones);
+        let mut ev = [Event { step: 0, st: [0; 8] }; EVENTS];
+        let mut step = 0usize;
+        while step < common {
+            let mut nev = 0usize;
+            while step < common && nev < EVENTS {
+                // SAFETY: pos[g] + step < stop[g] <= hay.len() for every g;
+                // table rows are 256 entries of [u64; 2].
+                unsafe {
+                    let (c0, c1, c2, c3) = (
+                        *p0.add(step) as usize,
+                        *p1.add(step) as usize,
+                        *p2.add(step) as usize,
+                        *p3.add(step) as usize,
+                    );
+                    s0 = vorrq_u64(vandq_u64(vshlq_n_u64::<1>(s0), keep_v), vld1q_u64(tp.add(c0 * 2)));
+                    s1 = vorrq_u64(vandq_u64(vshlq_n_u64::<1>(s1), keep_v), vld1q_u64(tp.add(c1 * 2)));
+                    s2 = vorrq_u64(vandq_u64(vshlq_n_u64::<1>(s2), keep_v), vld1q_u64(tp.add(c2 * 2)));
+                    s3 = vorrq_u64(vandq_u64(vshlq_n_u64::<1>(s3), keep_v), vld1q_u64(tp.add(c3 * 2)));
+                    // An end bit is clear in the AND of all segments iff it
+                    // is clear in some segment.
+                    let acc = vandq_u64(vandq_u64(s0, s1), vandq_u64(s2, s3));
+                    let hits = vbicq_u64(ends_v, acc);
+                    // Branch-free record: always store the four state
+                    // vectors ([a_g, b_g] lands at st[g*2], st[g*2+1] —
+                    // the layout drain_events expects).
+                    // SAFETY: nev < EVENTS by the loop condition.
+                    let e = ev.get_unchecked_mut(nev);
+                    e.step = step as u32;
+                    let sp = e.st.as_mut_ptr();
+                    vst1q_u64(sp, s0);
+                    vst1q_u64(sp.add(2), s1);
+                    vst1q_u64(sp.add(4), s2);
+                    vst1q_u64(sp.add(6), s3);
+                    let any = vmaxvq_u32(vreinterpretq_u32_u64(hits));
+                    nev += (any != 0) as usize;
+                }
+                step += 1;
+            }
+            if nev != 0 {
+                self.drain_events(&ev[..nev], l0, 2, &pos, &report_from, runs);
+            }
+        }
+        // Remainders via the scalar tail (a few bytes at most).
+        let (ta, tb): (&[u64; 256], &[u64; 256]) = (&la.table, &lb.table);
+        let (ka, kb) = (la.keep, lb.keep);
+        let (ea, eb) = (la.ends, lb.ends);
+        let mut st = [0u64; 8];
+        unsafe {
+            vst1q_u64(st.as_mut_ptr(), s0);
+            vst1q_u64(st.as_mut_ptr().add(2), s1);
+            vst1q_u64(st.as_mut_ptr().add(4), s2);
+            vst1q_u64(st.as_mut_ptr().add(6), s3);
+        }
+        for g in 0..SEGS {
+            for i in pos[g] + common..stop[g] {
+                let c = hay[i] as usize;
+                st[g * 2] = ((st[g * 2] << 1) & ka) | ta[c];
+                st[g * 2 + 1] = ((st[g * 2 + 1] << 1) & kb) | tb[c];
+                if i >= report_from[g] {
+                    if !st[g * 2] & ea != 0 {
+                        runs.emit_one(self, l0, st[g * 2], i, g);
+                    }
+                    if !st[g * 2 + 1] & eb != 0 {
+                        runs.emit_one(self, l0 + 1, st[g * 2 + 1], i, g);
+                    }
+                }
+            }
+        }
     }
 
     /// Two-lane kernel. Every (segment, lane) state is a named local so it

@@ -38,6 +38,14 @@ That removes the 3-op shift concern entirely: `vshlq_n_u64` is one op.
 Effort: S–M. **Verdict: do** — cheap, and it is the only lever left on
 the dense lane's scan cost.
 
+*Status:* done (NEON). 2-lane no-match scan 0.68 → 0.53 ns/byte (+28%);
+W4 find_all 0.76 → 0.88 GB/s, count 1.23; wiki (a) 1.08 → 1.29 (the
+referee now routes it dense). One consequence, still open: routing is
+refereed on `find_all` only, so wiki (a)'s `find_leftmost` inherits the
+dense route where the scalar leftmost state machine is slower (0.87 →
+0.54 GB/s) — leftmost-aware routing (or a NEON leftmost kernel) is the
+follow-up. AVX2/AVX-512 4-lane variants also still open.
+
 ### 1.2 AVX-512 VBMI 6-bit classes (`VPERMB`, 64-entry tables)
 DESIGN.md §7 already names it. Closure inflation (Lemma 1) is the
 nibble cross-product; with 6-bit/2-bit splits the cross product shrinks

@@ -157,7 +157,9 @@ ROADMAP §3), not faster confirmation.
   routed by the cost model to a multi-pattern Shift-Or lane (`src/dense.rs`:
   64-bit lanes, one bit per pattern byte, up to 4 lanes; four haystack
   segments scanned in lock-step so the shift/or chain never stalls; hits
-  recorded branch-free and decoded out of the loop). The rest stay sparse.
+  recorded branch-free and decoded out of the loop; on aarch64 the lane
+  pair packs into one NEON register — one table load per segment-step).
+  The rest stay sparse.
   The model shortlists partitions; a timed referee then scans the corpus
   sample with the sparse-only baseline and the best splits as built and
   keeps the fastest (`routing_decision()` reports what it saw).

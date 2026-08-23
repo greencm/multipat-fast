@@ -12,6 +12,7 @@
 //! (one compiled filter each) when the model says splitting is cheaper.
 //! See `docs/DESIGN.md` for the theorems this implementation realizes.
 
+use crate::dense::{self, DenseLane};
 use crate::{BuildError, MatchOpts};
 
 /// Maximum number of sampled positions (one shuffle pair per plane each).
@@ -673,4 +674,64 @@ pub(crate) fn build(
     } else {
         Ok(vec![single])
     }
+}
+
+/// Two-prong build: route a subset of patterns to the dense (Shift-Or)
+/// lane and the rest to sampled-position cohorts, choosing the partition
+/// with the lowest total model cost. Candidates are "every pattern of
+/// length <= L" for each distinct L: short, common patterns are what make
+/// a filter hopeless, and Shift-Or capacity is spent per pattern byte, so
+/// shortest-first is the natural ordering.
+pub(crate) fn build_routed(
+    patterns: &[Box<[u8]>],
+    opts: &BuildOpts,
+    dense_enabled: bool,
+    force_dense: bool,
+) -> Result<(Vec<Compiled>, Option<DenseLane>), BuildError> {
+    if force_dense {
+        let ids: Vec<u32> = (0..patterns.len() as u32).collect();
+        if let Some(lane) = DenseLane::compile(&ids, patterns, &opts.match_opts, &[]) {
+            return Ok((Vec::new(), Some(lane)));
+        }
+    }
+    let sparse_only = build(patterns, opts)?;
+    if !dense_enabled || opts.forced_positions.is_some() {
+        return Ok((sparse_only, None));
+    }
+    let corpus = opts.corpus.unwrap_or(DEFAULT_CORPUS);
+    let mut best_cost: f64 = sparse_only.iter().map(|c| c.expected_cost).sum();
+    let mut best: (Vec<Compiled>, Option<DenseLane>) = (sparse_only, None);
+
+    let mut lens: Vec<usize> = patterns.iter().map(|p| p.len()).collect();
+    lens.sort_unstable();
+    lens.dedup();
+    for &l in lens.iter().filter(|&&l| l <= dense::MAX_PATTERN_LEN) {
+        let (dense_ids, rest_ids): (Vec<u32>, Vec<u32>) =
+            (0..patterns.len() as u32).partition(|&i| patterns[i as usize].len() <= l);
+        let Some(lane) = DenseLane::compile(&dense_ids, patterns, &opts.match_opts, corpus) else {
+            break; // longer thresholds only add patterns; none will fit either
+        };
+        let (cohorts, cost) = if rest_ids.is_empty() {
+            (Vec::new(), 0.0)
+        } else {
+            let subset: Vec<Box<[u8]>> =
+                rest_ids.iter().map(|&i| patterns[i as usize].clone()).collect();
+            let mut cs = build(&subset, opts)?;
+            for c in &mut cs {
+                for b in &mut c.buckets {
+                    for e in b.iter_mut() {
+                        e.id = rest_ids[e.id as usize];
+                    }
+                }
+            }
+            let cost = cs.iter().map(|c| c.expected_cost).sum();
+            (cs, cost)
+        };
+        let total = cost + lane.expected_cost();
+        if total < best_cost {
+            best_cost = total;
+            best = (cohorts, Some(lane));
+        }
+    }
+    Ok(best)
 }

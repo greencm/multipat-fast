@@ -38,6 +38,9 @@ mod avx512;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 pub mod naive;
+pub mod dense;
+
+use dense::DenseLane;
 
 use builder::{Compiled, Entry};
 
@@ -119,6 +122,8 @@ pub struct Builder {
     corpus_score: bool,
     match_opts: MatchOpts,
     forced_engine: Option<Engine>,
+    dense_lane: bool,
+    force_dense: bool,
 }
 
 impl Default for Builder {
@@ -137,6 +142,8 @@ impl Builder {
             corpus_score: true,
             match_opts: MatchOpts::default(),
             forced_engine: None,
+            dense_lane: true,
+            force_dense: false,
         }
     }
 
@@ -207,6 +214,22 @@ impl Builder {
 
     /// Force a specific scan kernel (mainly for tests and benchmarks).
     /// Errors at build time if the CPU lacks the required features.
+    /// Enable the two-prong build (default on): patterns that no
+    /// sampled-position filter can handle cheaply (short, common) are routed
+    /// to a bit-parallel Shift-Or lane, the rest to sparse cohorts, when the
+    /// model says the split is cheaper. Off = pure sampled-position matcher.
+    pub fn dense_lane(mut self, on: bool) -> Builder {
+        self.dense_lane = on;
+        self
+    }
+
+    /// Route every pattern to the dense lane if it fits (testing / probing).
+    #[doc(hidden)]
+    pub fn force_dense(mut self, on: bool) -> Builder {
+        self.force_dense = on;
+        self
+    }
+
     pub fn force_engine(mut self, engine: Engine) -> Builder {
         self.forced_engine = Some(engine);
         self
@@ -227,7 +250,7 @@ impl Builder {
             corpus_score: self.corpus_score,
             match_opts: self.match_opts,
         };
-        let cohorts = builder::build(&pats, &opts)?;
+        let (cohorts, dense) = builder::build_routed(&pats, &opts, self.dense_lane, self.force_dense)?;
         let engine = match self.forced_engine {
             Some(e) => {
                 if !engine_available(e) {
@@ -238,7 +261,7 @@ impl Builder {
             None => detect_engine(),
         };
         let max_len = pats.iter().map(|p| p.len()).max().unwrap();
-        Ok(Sparrow { patterns: pats, cohorts, engine, match_opts: self.match_opts, max_len })
+        Ok(Sparrow { patterns: pats, cohorts, dense, engine, match_opts: self.match_opts, max_len })
     }
 }
 
@@ -273,6 +296,7 @@ fn detect_engine() -> Engine {
 pub struct Sparrow {
     patterns: Vec<Box<[u8]>>,
     cohorts: Vec<Compiled>,
+    dense: Option<DenseLane>,
     engine: Engine,
     match_opts: MatchOpts,
     max_len: usize,
@@ -302,12 +326,28 @@ impl Sparrow {
     /// Find all (overlapping) occurrences of all patterns, sorted by
     /// `(start, end, pattern)`.
     pub fn find_all(&self, haystack: &[u8]) -> Vec<Match> {
+        let mut out = self.find_all_unsorted(haystack);
+        // Every engine emits a sorted run, so the concatenation is a handful
+        // of sorted runs; the stable sort detects and merges them in ~O(n)
+        // (sort_unstable would pay a full n log n on match-dense inputs).
+        out.sort();
+        out
+    }
+
+    /// Find all (overlapping) occurrences of all patterns, in the order the
+    /// engines produce them: each cohort and each dense-lane segment emits
+    /// in increasing position, but the runs are concatenated, not merged.
+    /// Use this when order doesn't matter — on match-dense inputs the sort
+    /// in [`find_all`](Self::find_all) can cost as much as the scan.
+    pub fn find_all_unsorted(&self, haystack: &[u8]) -> Vec<Match> {
         let mut out = Vec::new();
         for c in &self.cohorts {
             let ctx = ScanCtx { c, patterns: &self.patterns, opts: self.match_opts };
             self.scan_cohort(&ctx, haystack, &mut out);
         }
-        out.sort_unstable();
+        if let Some(d) = &self.dense {
+            d.find_all(haystack, &mut out);
+        }
         out
     }
 
@@ -378,6 +418,9 @@ impl Sparrow {
             let ctx = ScanCtx { c, patterns: &self.patterns, opts: self.match_opts };
             scalar::find_in_range(&ctx, haystack, 0, haystack.len(), &mut out);
         }
+        if let Some(d) = &self.dense {
+            d.find_all(haystack, &mut out);
+        }
         out.sort_unstable();
         out
     }
@@ -387,8 +430,14 @@ impl Sparrow {
         self.engine
     }
 
+    /// The dense (Shift-Or) lane, if the router gave it any patterns.
+    pub fn dense_lane(&self) -> Option<&DenseLane> {
+        self.dense.as_ref()
+    }
+
     /// Number of compiled length cohorts (1 unless the cost model chose to
-    /// split the pattern set by length).
+    /// split the pattern set by length; 0 if every pattern went to the
+    /// dense lane).
     pub fn cohort_count(&self) -> usize {
         self.cohorts.len()
     }
@@ -407,7 +456,8 @@ impl Sparrow {
     /// minimized (expected pattern comparisons + scan terms), summed over
     /// cohorts.
     pub fn expected_cost(&self) -> f64 {
-        self.cohorts.iter().map(|c| c.expected_cost).sum()
+        self.cohorts.iter().map(|c| c.expected_cost).sum::<f64>()
+            + self.dense.as_ref().map_or(0.0, |d| d.expected_cost())
     }
 
     /// Model-expected candidate bits per haystack byte under the i.i.d.
@@ -422,7 +472,12 @@ impl Sparrow {
 
     /// Length of the shortest pattern.
     pub fn min_pattern_len(&self) -> usize {
-        self.cohorts.iter().map(|c| c.min_len).min().unwrap()
+        self.cohorts
+            .iter()
+            .map(|c| c.min_len)
+            .chain(self.dense.as_ref().map(|d| d.min_len()))
+            .min()
+            .unwrap()
     }
 
     /// Heap/working-set footprint of the compiled matcher, by component.
@@ -439,6 +494,9 @@ impl Sparrow {
                 .iter()
                 .map(|b| b.len() * std::mem::size_of::<Entry>())
                 .sum::<usize>();
+        }
+        if let Some(d) = &self.dense {
+            u.scalar_tables += d.table_bytes();
         }
         u.patterns = self
             .patterns

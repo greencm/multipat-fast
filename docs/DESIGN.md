@@ -149,6 +149,64 @@ band compiled into its own filter with its own window, and the split is
 adopted iff the summed total cost — which charges each cohort its own scan
 term, i.e. the extra haystack pass — beats the single filter.
 
+### 3.5 The dense lane (two-prong build)
+
+A sampled-position filter pays per *candidate*. When the pattern set
+contains short, common words and the text is match-dense ("the", "and"
+over English), candidates arrive every few bytes and no choice of
+positions helps: the optimizer's own cost lands at 0.3–0.6 per byte, and a
+DFA — flat cost per byte — wins. The two-prong build acts on that
+prediction instead of losing to it.
+
+The dense lane is multi-pattern Shift-Or (Baeza-Yates–Gonnet; the
+multi-pattern packing from Navarro–Raffinot): every pattern byte is one
+bit of a 64-bit lane, `B[c]` has bit `(off+j)` clear iff pattern byte `j`
+accepts `c`, and the per-byte update is `s = ((s << 1) & keep) | B[c]`
+(`keep` clears each pattern's start bit so the shift re-activates it; bit
+0 is free). A match of the pattern ending at bit `e` is `s & (1<<e) == 0`.
+Its critical path is three register ops; the only memory reference is
+`B[c]`, independent of state, so it pipelines. Against a DFA's dependent
+`table[state][byte]` load (~4–5 cycles/byte) that is the structural win.
+
+Kernel facts that matter in practice, all measured rather than assumed:
+
+* The update chain is hidden by scanning **four haystack segments in
+  lock-step** with independent state (each starts `max_len − 1` bytes
+  early from the all-ones state, which makes Shift-Or exact again after
+  `max_len − 1` bytes — the same property that makes streaming trivial).
+  With that, the kernel is instruction-throughput bound at ≈0.35 ns/byte
+  per lane on Apple M-series, not latency bound.
+* Two lanes fit the register file with four segments; larger lane counts
+  run as additional passes over the same 64 KB chunk (L1-resident).
+* The hot loop is **call-free**: a hit is recorded branch-free (the
+  event slot is always written, the index advances on a hit) and decoded
+  after the loop. Every variant with a call or an unpredictable branch in
+  the loop measured 1.5–3× slower — a call makes LLVM keep all loop
+  invariants on the stack, and a mispredict costs as much as scanning
+  ~15 bytes.
+* Per-segment runs are emitted in end order and fixed into start order by
+  a linear insertion sort (displacement is bounded by one `max_len`
+  window), so `find_all`'s final ordering is a run merge, not an
+  `n log n` sort — which on 900 K matches had cost as much as the scan.
+
+**Routing.** For each distinct pattern length `L` (≤ 32), "every pattern
+of length ≤ L" is offered to the dense lane (capacity permitting) and the
+rest compiled sparse as usual (with cohort arbitration). Total cost is
+`LANE_COST · lanes + MATCH_COST · r + Σ cohort costs`, where `r` is the
+dense lane's match rate *measured on the corpus sample* (the sparse cohorts
+already pay for true matches through their candidate term; the dense lane
+charges for them explicitly). The cheapest partition wins, the sparse-only
+build included. Shortest-first is the right family of partitions because
+short common patterns are what blind a filter and Shift-Or capacity is
+spent per pattern byte.
+
+Measured (Apple M-series, 16 MiB): the mixed workload goes from 0.36 GB/s
+sparse-only to 0.75 two-prong (DFA 0.50); the sparse lane's window, no
+longer pinned by 3-byte words, moves from positions `[0,1,2]` to `[9]`.
+On the all-6-to-11-byte English set the router also picks dense, and the
+result is a tie (0.97 vs 1.02) — the sparse cost model overestimates
+itself there, an existing calibration issue the router inherits.
+
 ## 4. Guarantees
 
 **Lemma 1 (closure exactness).** For every bucket `b` and position `j`, the
@@ -329,3 +387,12 @@ its packed searcher is the reference Teddy implementation):
   there.
 * Verification scans whole buckets; for very large rule sets a per-bucket
   hash or sorted-by-guard layout would sublinearize it.
+* The dense lane is scalar (64-bit lanes). A NEON/AVX2 version would hold
+  two or four lanes per vector and halve its table loads; the 128-bit
+  shift costs three ops, so the expected gain is ~20–30%, not 2×. Its
+  capacity cap (4 lanes = 256 pattern bytes) is a model choice, not a
+  kernel limit.
+* The sparse and dense cost scales are each calibrated against
+  measurements but not against *each other*; a per-build microbenchmark
+  referee (time both candidates on the corpus sample) would make routing
+  decisions empirical the way position selection already is.

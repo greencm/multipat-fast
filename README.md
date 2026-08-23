@@ -42,13 +42,30 @@ strictly better empirical referee).
 | shared-prefix routes / near-miss log | **6.20 GB/s** | 0.69 | 1.39 |
 | short words + long signatures (match-heavy) | 0.20 GB/s | 0.40 | 0.33 |
 
+Apple M-series (NEON engine, same harness, plus a textbook Wu-Manber
+comparator — the classic block-shift "skip" algorithm), with the two-prong
+build (§ dense lane below):
+
+| Workload | SPARROW two-prong | SPARROW sparse-only | Teddy (packed) | AC DFA | Wu-Manber (B=3) |
+|---|---|---|---|---|---|
+| English words / English text | 0.97 GB/s | 1.02 | 0.96 | 0.48 | 0.49 |
+| 64 random len-8 / random bytes | **4.5 GB/s** | 4.5 | 4.5 | 0.51 | 0.83 |
+| shared-prefix routes / near-miss log | **9.0 GB/s** | 9.0 | 1.2 | 2.4 | 1.8 |
+| short words + long signatures (match-heavy) | **0.75 GB/s** | 0.36 | 0.43 | 0.50 | 0.37 |
+
 Shared prefixes (`GET /api/v1/…`, magic numbers, protocol headers) are the
 common case in IDS/log scanning and the structural blind spot of
 prefix-anchored filters: there SPARROW is **9× the reference Teddy**, and
 9× its own prefix-positions ablation — same kernel, so the win is entirely
 the position optimizer + empirical referee. On random patterns it beats
 Teddy by 29%; on match-heavy workloads (last row) filtering is irrelevant
-by construction and the automaton wins — the cost model predicts this.
+by construction — the cost model predicts this, and the two-prong build
+acts on it: the short, common patterns are routed to a bit-parallel
+Shift-Or lane (flat cost per byte, no dependent loads), the long
+signatures keep a sparse filter with a window no longer pinned by "the",
+and the combination is 2.1× the sparse-only matcher and 1.5× the DFA.
+Wu-Manber skips bytes but verifies on every shared-prefix near-miss; it
+never beats a SIMD filter that touches every byte 16–64 at a time.
 
 ## Features
 
@@ -65,6 +82,16 @@ by construction and the automaton wins — the cost model predicts this.
   (`?`-globs).
 - **Verification**: per-entry guard probes (the model-rarest unsampled
   pattern byte) reject most false candidates with one load.
+- **Dense lane (two-prong build)**: patterns no sampled-position filter
+  can handle cheaply — short, common words on match-dense text — are
+  routed by the cost model to a multi-pattern Shift-Or lane (`src/dense.rs`:
+  64-bit lanes, one bit per pattern byte, up to 4 lanes; four haystack
+  segments scanned in lock-step so the shift/or chain never stalls; hits
+  recorded branch-free and decoded out of the loop). The rest stay sparse.
+  The split is adopted only when its summed model cost — lanes plus the
+  match rate observed on the corpus sample — beats the sparse-only build.
+  `dense_lane(false)` disables it; `find_all_unsorted` skips the final
+  run-merge when order doesn't matter.
 
 ## Usage
 
@@ -94,7 +121,8 @@ Other knobs: `max_positions(k)`, `wildcard_byte(Some(b'?'))`,
 - `src/builder.rs` — the offline optimizer (byte classes, closure-exact
   objective, position search, greedy + local-search bucketing, plane and
   cohort arbitration, empirical referee, guard selection)
-- `src/avx2.rs`, `src/avx512.rs`, `src/scalar.rs` — runtime engines
+- `src/avx2.rs`, `src/avx512.rs`, `src/neon.rs`, `src/scalar.rs` — sparse
+  runtime engines; `src/dense.rs` — the Shift-Or dense lane
 - `docs/DESIGN.md` — survey, algorithm spec, theorems and proofs, novelty
   analysis, benchmark details
 - `docs/CACHE.md` — working-set model, measured cache-residency sweeps and
@@ -103,6 +131,10 @@ Other knobs: `max_positions(k)`, `wildcard_byte(Some(b'?'))`,
   per ~6 bytes once its table exceeds L1)
 - `examples/cache_probe.rs` — footprint + cache-residency measurement tool
 - `tests/correctness.rs` — differential fuzzing vs a brute-force oracle
-  and vs `aho-corasick`, across all engines and semantics
+  and vs `aho-corasick`, across all engines and semantics;
+  `tests/dense.rs` — the same for the dense lane and the router (chunk and
+  segment boundaries, multi-lane passes, streaming, semantics)
 - `examples/bench.rs` — the benchmark harness (`cargo run --release
-  --example bench`)
+  --example bench`): SPARROW (two-prong, sparse-only, prefix ablation) vs
+  aho-corasick DFA, packed Teddy, and a textbook Wu-Manber
+- `examples/dense_probe.rs` — dense-lane microbenchmark (scan vs hit cost)

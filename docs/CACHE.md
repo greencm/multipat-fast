@@ -136,6 +136,18 @@ dependent misses.)
   entry array) would remove a dependent load; entry+pattern data for
   realistic rule sets (≤ a few thousand patterns) stays L1/L2-resident.
 
+## 5b. Footprint at scale
+
+`examples/scale_bench.rs` (rare words from the Wikipedia corpus): SPARROW
+compiles 16 K patterns into ~1 MB — filter tables are unchanged (the
+SIMD-hot state stays 128–512 B; four planes at most), hashed-bucket
+offset tables add 257 × 4 B per big bucket, and the rest is the patterns
+themselves plus 8 B per entry. The AC DFA needs 26 MB for the same set
+(every scanned byte then misses to L2/L3); the contiguous NFA is
+comparable to SPARROW in size but pointer-chases. SPARROW's problem at
+that scale is not memory, it is filter selectivity (see README scaling
+table): the candidate rate, not the working set, is what degrades.
+
 ## 6. Reproducing
 
 ```

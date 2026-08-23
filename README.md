@@ -96,6 +96,29 @@ high candidate rate, and the DFA wins by 1.7× — exactly the scale
 weakness ROADMAP §3 (hashed verification, more planes) targets. Routing
 matched the fastest measured configuration on every set.
 
+### Pattern-set scaling (rare words from the wiki corpus, 32 MB haystack, aarch64/M-series)
+
+| n patterns | SPARROW | AC DFA | AC contig-NFA | SPARROW KB | DFA KB | NFA KB | build (spw / DFA) |
+|---|---|---|---|---|---|---|---|
+| 64 | **3.31 GB/s** | 0.60 | 0.21 | 6 | 156 | 25 | 175 ms / 0.4 ms |
+| 256 | **1.09** | 0.59 | 0.17 | 20 | 566 | 70 | 649 ms / 1 ms |
+| 1 024 | 0.31 | 0.53 | 0.17 | 97 | 2 062 | 184 | 2.1 s / 4 ms |
+| 4 096 | 0.13 | 0.40 | 0.16 | 270 | 7 592 | 517 | 2.6 s / 16 ms |
+| 16 384 | 0.045 | 0.30 | 0.13 | 1 006 | 26 198 | 1 584 | 6.7 s / 67 ms |
+
+(`cargo run --release --example scale_bench`; packed Teddy refuses every
+set above 64.) The footprint story holds at scale — 26× smaller than the
+DFA at 16 K patterns, comparable to the contiguous NFA — but throughput
+does not: past ~500 patterns the *filter itself* saturates (candidate
+rate 0.006/byte at 256 → 0.46/byte at 16 K; nibble closure of a
+500-entry bucket passes almost everything), which no verification
+speedup can recover. Hashed verification and 32 buckets moved the
+crossover vs the DFA from ~300 to ~800 patterns and made 256 rare words
+2.7× faster (0.36 → 0.98 GB/s on the wiki set), but SPARROW remains a
+hundreds-of-patterns engine; honest scaling past that needs more filter
+selectivity (more planes, more positions, or hierarchical filters —
+ROADMAP §3), not faster confirmation.
+
 ## Features
 
 - **Engines**: AVX-512BW (64-byte blocks, `VPTESTMB` extraction), AVX2,

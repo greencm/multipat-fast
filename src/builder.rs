@@ -310,10 +310,20 @@ fn greedy_assign(classes: &[Vec<Class>], k: usize, nb: usize, model: &Model) -> 
 /// buckets until a fixpoint (or a safety cap). Each accepted move strictly
 /// decreases the cost, so this terminates (DESIGN.md, Thm 3).
 fn refine(a: &mut Assignment, classes: &[Vec<Class>], k: usize, model: &Model) {
-    const MAX_PASSES: usize = 32;
     const MIN_GAIN: f64 = 1e-15;
     let nb = a.buckets.len();
-    for _ in 0..MAX_PASSES {
+    let n: usize = a.buckets.iter().map(|b| b.len()).sum();
+    // Local-search effort must scale down with occupancy: one pass costs
+    // O(n * occupancy * k) in `rebuild` alone, and once buckets hold
+    // dozens of members their nibble closure is near-saturated — moves
+    // stop mattering long before the search stops finding epsilon gains.
+    let max_passes = match n / nb.max(1) {
+        0..=8 => 32,
+        9..=32 => 8,
+        33..=128 => 2,
+        _ => 0,
+    };
+    for _ in 0..max_passes {
         let mut improved = false;
         for b0 in 0..nb {
             let mut idx = 0;
@@ -547,8 +557,16 @@ fn compile_cohort(
     // (the i.i.d. model systematically underprices correlated positions,
     // so high-k sets must reach the empirical referee even when a cheap
     // low-k set looks better under independence), plus the prefix baseline.
-    let mut finalists: Vec<Vec<u8>> = scored.iter().take(8).map(|(_, p)| p.clone()).collect();
+    // Stage-2 search effort scales down with set size: each finalist costs
+    // a greedy assignment + refinement per plane option, and above a few
+    // thousand patterns the filter is occupancy-bound, not position-bound.
+    let wide = n <= 2048;
+    let mut finalists: Vec<Vec<u8>> =
+        scored.iter().take(if wide { 8 } else { 3 }).map(|(_, p)| p.clone()).collect();
     for size in 1..=kmax {
+        if !wide {
+            break;
+        }
         if let Some((_, p)) = scored.iter().find(|(_, p)| p.len() == size) {
             if !finalists.contains(p) {
                 finalists.push(p.clone());
@@ -562,7 +580,9 @@ fn compile_cohort(
     // Stage 2: for each finalist and each plane count, refine and score
     // under the selection model (empirical corpus scan if enabled, i.i.d.
     // closed form otherwise).
-    let plane_options: &[usize] = if n >= 128 {
+    let plane_options: &[usize] = if n > 2048 {
+        &[2, 4]
+    } else if n >= 128 {
         &[1, 2, 4]
     } else if n >= 32 {
         &[1, 2]

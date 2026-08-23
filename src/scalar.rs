@@ -3,17 +3,17 @@
 //! the nibble cross-product closure), so all engines produce the same
 //! candidates up to boundary bits that verification filters out.
 
-use crate::{verify_at, Match, ScanCtx};
+use crate::{verify_at, ScanCtx, Sink};
 
 /// Scan candidate anchors t in [t_start, t_end). A candidate anchored at t
 /// corresponds to a window starting at t - s_last; anchors below s_last are
 /// skipped because their window would begin before the haystack.
-pub(crate) fn find_in_range(
+pub(crate) fn find_in_range<S: Sink>(
     ctx: &ScanCtx<'_>,
     hay: &[u8],
     t_start: usize,
     t_end: usize,
-    out: &mut Vec<Match>,
+    out: &mut S,
 ) {
     let c = ctx.c;
     let t0 = t_start.max(c.s_last);

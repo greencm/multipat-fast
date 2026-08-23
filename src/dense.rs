@@ -16,7 +16,7 @@
 //! sampled-position filter (the router decides by model cost).
 
 use crate::pattern::Pat;
-use crate::Match;
+use crate::{Match, Sink};
 
 /// Bits per lane.
 pub const LANE_BITS: usize = 64;
@@ -249,13 +249,39 @@ impl DenseLane {
         }
     }
 
+    /// Sink-directed scan: same kernels and event machinery as
+    /// [`find_all`](Self::find_all), but events are decoded straight into
+    /// the sink — no per-segment run buffers, no ordering work. Emission
+    /// order is per-chunk, interleaved across segments.
+    pub(crate) fn scan_unordered<S: Sink>(&self, hay: &[u8], sink: &mut S) {
+        if hay.len() < self.min_len {
+            return;
+        }
+        let mut drain = SinkDrain(sink);
+        let mut off = 0usize;
+        while off < hay.len() {
+            let end = (off + CHUNK).min(hay.len());
+            let mut l = 0;
+            while l < self.lanes.len() {
+                if l + 2 <= self.lanes.len() {
+                    self.scan_chunk2(hay, off, end, l, &mut drain);
+                    l += 2;
+                } else {
+                    self.scan_chunk1(hay, off, end, l, &mut drain);
+                    l += 1;
+                }
+            }
+            off = end;
+        }
+    }
+
     pub fn find_all(&self, hay: &[u8], out: &mut Vec<Match>) {
         if hay.len() < self.min_len {
             return;
         }
         // Per-segment run buffers, reused across chunks so they stay hot
         // and never page-fault; `out` grows once.
-        let mut runs: [Vec<Match>; SEGS] = std::array::from_fn(|_| Vec::new());
+        let mut runs = RunDrain(std::array::from_fn(|_| Vec::new()));
         let mut off = 0usize;
         while off < hay.len() {
             let end = (off + CHUNK).min(hay.len());
@@ -279,7 +305,7 @@ impl DenseLane {
             // of different passes interleave in position, so with several
             // passes use a real sort on the (small, cache-hot) run.
             let passes = self.lanes.len().div_ceil(2);
-            for r in runs.iter_mut() {
+            for r in runs.0.iter_mut() {
                 if passes == 1 {
                     insertion_sort(r);
                 } else {
@@ -297,14 +323,14 @@ impl DenseLane {
     /// scanning ~15 bytes). Lives outside the scan loop so that loop stays
     /// call-free and its invariants stay in registers.
     #[inline(never)]
-    fn drain_events(
+    fn drain_events<D: Drain>(
         &self,
         ev: &[Event],
         lane0: usize,
         nl: usize,
         pos: &[usize; SEGS],
         report_from: &[usize; SEGS],
-        runs: &mut [Vec<Match>; SEGS],
+        drain: &mut D,
     ) {
         let ends = [self.lanes[lane0].ends, if nl == 2 { self.lanes[lane0 + 1].ends } else { 0 }];
         for e in ev {
@@ -318,7 +344,7 @@ impl DenseLane {
                 let (g, l) = (k / 2, k % 2);
                 let i = pos[g] + e.step as usize;
                 if i >= report_from[g] {
-                    self.emit(lane0 + l, e.st[k], i, &mut runs[g]);
+                    drain.emit_one(self, lane0 + l, e.st[k], i, g);
                 }
             }
         }
@@ -327,14 +353,14 @@ impl DenseLane {
     /// Report every pattern whose end bit is clear in `s` at haystack
     /// offset `i`.
     #[inline(always)]
-    fn emit(&self, lane: usize, s: u64, i: usize, run: &mut Vec<Match>) {
+    fn emit<S: Sink>(&self, lane: usize, s: u64, i: usize, run: &mut S) {
         let ln = &self.lanes[lane];
         let mut hits = !s & ln.ends;
         loop {
             let bit = hits.trailing_zeros() as usize;
             hits &= hits - 1;
             let (id, len) = ln.end_info[bit];
-            run.push(Match { start: i + 1 - len as usize, end: i + 1, pattern: id as usize });
+            run.accept(Match { start: i + 1 - len as usize, end: i + 1, pattern: id as usize });
             if hits == 0 {
                 break;
             }
@@ -366,7 +392,7 @@ impl DenseLane {
     /// lives in a register; the only memory reads per step are 4 haystack
     /// bytes and 8 (L1-resident) table rows, none dependent on state.
     #[inline(never)]
-    fn scan_chunk2(&self, hay: &[u8], lo: usize, hi: usize, l0: usize, runs: &mut [Vec<Match>; SEGS]) {
+    fn scan_chunk2<D: Drain>(&self, hay: &[u8], lo: usize, hi: usize, l0: usize, runs: &mut D) {
         let (pos, stop, report_from, common) = self.segments(lo, hi);
         let (la, lb) = (&self.lanes[l0], &self.lanes[l0 + 1]);
         let (ta, tb): (&[u64; 256], &[u64; 256]) = (&la.table, &lb.table);
@@ -425,10 +451,10 @@ impl DenseLane {
                 st[g * 2 + 1] = ((st[g * 2 + 1] << 1) & kb) | tb[c];
                 if i >= report_from[g] {
                     if !st[g * 2] & ea != 0 {
-                        self.emit(l0, st[g * 2], i, &mut runs[g]);
+                        runs.emit_one(self, l0, st[g * 2], i, g);
                     }
                     if !st[g * 2 + 1] & eb != 0 {
-                        self.emit(l0 + 1, st[g * 2 + 1], i, &mut runs[g]);
+                        runs.emit_one(self, l0 + 1, st[g * 2 + 1], i, g);
                     }
                 }
             }
@@ -437,7 +463,7 @@ impl DenseLane {
 
     /// One-lane kernel (see `scan_chunk2`).
     #[inline(never)]
-    fn scan_chunk1(&self, hay: &[u8], lo: usize, hi: usize, l0: usize, runs: &mut [Vec<Match>; SEGS]) {
+    fn scan_chunk1<D: Drain>(&self, hay: &[u8], lo: usize, hi: usize, l0: usize, runs: &mut D) {
         let (pos, stop, report_from, common) = self.segments(lo, hi);
         let la = &self.lanes[l0];
         let ta: &[u64; 256] = &la.table;
@@ -481,10 +507,35 @@ impl DenseLane {
                 let c = hay[i] as usize;
                 st[g] = ((st[g] << 1) & ka) | ta[c];
                 if i >= report_from[g] && !st[g] & ea != 0 {
-                    self.emit(l0, st[g], i, &mut runs[g]);
+                    runs.emit_one(self, l0, st[g], i, g);
                 }
             }
         }
+    }
+}
+
+/// Where the chunk kernels deliver decoded hits: per-segment run buffers
+/// (the ordered `find_all` path) or a raw sink (`scan_unordered`).
+/// Monomorphised so the event-drain path stays call-free.
+pub(crate) trait Drain {
+    fn emit_one(&mut self, dl: &DenseLane, lane: usize, s: u64, i: usize, g: usize);
+}
+
+/// Ordered path: hits land in the emitting segment's run buffer.
+struct RunDrain([Vec<Match>; SEGS]);
+impl Drain for RunDrain {
+    #[inline(always)]
+    fn emit_one(&mut self, dl: &DenseLane, lane: usize, s: u64, i: usize, g: usize) {
+        dl.emit(lane, s, i, &mut self.0[g]);
+    }
+}
+
+/// Unordered path: hits go straight to the sink.
+struct SinkDrain<'a, S: Sink>(&'a mut S);
+impl<S: Sink> Drain for SinkDrain<'_, S> {
+    #[inline(always)]
+    fn emit_one(&mut self, dl: &DenseLane, lane: usize, s: u64, i: usize, _g: usize) {
+        dl.emit(lane, s, i, self.0);
     }
 }
 

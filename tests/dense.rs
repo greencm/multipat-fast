@@ -269,3 +269,35 @@ fn build_time_with_referee_is_bounded() {
     let dt = t.elapsed();
     assert!(dt.as_millis() < 500, "build took {:?}", dt);
 }
+
+#[test]
+fn scan_with_and_count_match_find_all() {
+    let mut rng = Rng(0xCAB);
+    for round in 0..30 {
+        let hay = english(&mut rng, if round % 6 == 0 { 200_000 } else { 700 });
+        let np = 1 + rng.below(10);
+        let p: Vec<Vec<u8>> = (0..np)
+            .map(|_| {
+                let s = rng.below(hay.len().saturating_sub(9).max(1));
+                let l = 1 + rng.below(8);
+                hay[s..(s + l).min(hay.len())].to_vec()
+            })
+            .filter(|w| !w.is_empty())
+            .collect();
+        if p.is_empty() {
+            continue;
+        }
+        for m in [
+            Builder::new().corpus_sample(&hay[..hay.len().min(1 << 16)]).build(&p).unwrap(),
+            Builder::new().force_dense(true).build(&p).unwrap(),
+            Builder::new().dense_lane(false).build(&p).unwrap(),
+        ] {
+            let expect = m.find_all(&hay);
+            assert_eq!(m.count_all(&hay), expect.len());
+            let mut got = Vec::new();
+            m.scan_with(&hay, |mm| got.push(mm));
+            got.sort_unstable();
+            assert_eq!(got, expect);
+        }
+    }
+}

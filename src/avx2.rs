@@ -8,7 +8,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::builder::{MAX_K, MAX_PLANES};
-use crate::{scalar, verify_at, Match, ScanCtx};
+use crate::{scalar, verify_at, ScanCtx, Sink};
 use core::arch::x86_64::*;
 
 /// SIMD blocks start at this offset; anchors below it go to the scalar
@@ -16,7 +16,7 @@ use core::arch::x86_64::*;
 const FIRST: usize = 32;
 
 #[target_feature(enable = "avx2")]
-unsafe fn kernel<const K: usize, const P: usize>(ctx: &ScanCtx<'_>, hay: &[u8], out: &mut Vec<Match>) {
+unsafe fn kernel<const K: usize, const P: usize, S: Sink>(ctx: &ScanCtx<'_>, hay: &[u8], out: &mut S) {
     let c = ctx.c;
     let len = hay.len();
     let low_mask = _mm256_set1_epi8(0x0F);
@@ -74,20 +74,20 @@ unsafe fn kernel<const K: usize, const P: usize>(ctx: &ScanCtx<'_>, hay: &[u8], 
 
 /// # Safety
 /// Caller must ensure AVX2 is available.
-pub(crate) unsafe fn find_all(ctx: &ScanCtx<'_>, hay: &[u8], out: &mut Vec<Match>) {
+pub(crate) unsafe fn find_all<S: Sink>(ctx: &ScanCtx<'_>, hay: &[u8], out: &mut S) {
     match (ctx.c.k, ctx.c.planes) {
-        (1, 1) => kernel::<1, 1>(ctx, hay, out),
-        (2, 1) => kernel::<2, 1>(ctx, hay, out),
-        (3, 1) => kernel::<3, 1>(ctx, hay, out),
-        (4, 1) => kernel::<4, 1>(ctx, hay, out),
-        (1, 2) => kernel::<1, 2>(ctx, hay, out),
-        (2, 2) => kernel::<2, 2>(ctx, hay, out),
-        (3, 2) => kernel::<3, 2>(ctx, hay, out),
-        (4, 2) => kernel::<4, 2>(ctx, hay, out),
-        (1, 4) => kernel::<1, 4>(ctx, hay, out),
-        (2, 4) => kernel::<2, 4>(ctx, hay, out),
-        (3, 4) => kernel::<3, 4>(ctx, hay, out),
-        (4, 4) => kernel::<4, 4>(ctx, hay, out),
+        (1, 1) => kernel::<1, 1, S>(ctx, hay, out),
+        (2, 1) => kernel::<2, 1, S>(ctx, hay, out),
+        (3, 1) => kernel::<3, 1, S>(ctx, hay, out),
+        (4, 1) => kernel::<4, 1, S>(ctx, hay, out),
+        (1, 2) => kernel::<1, 2, S>(ctx, hay, out),
+        (2, 2) => kernel::<2, 2, S>(ctx, hay, out),
+        (3, 2) => kernel::<3, 2, S>(ctx, hay, out),
+        (4, 2) => kernel::<4, 2, S>(ctx, hay, out),
+        (1, 4) => kernel::<1, 4, S>(ctx, hay, out),
+        (2, 4) => kernel::<2, 4, S>(ctx, hay, out),
+        (3, 4) => kernel::<3, 4, S>(ctx, hay, out),
+        (4, 4) => kernel::<4, 4, S>(ctx, hay, out),
         _ => unreachable!("k in 1..=4, planes in 1|2|4"),
     }
 }

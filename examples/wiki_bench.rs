@@ -124,6 +124,9 @@ fn run_set(name: &str, patterns: &[Vec<u8>], hay: &[u8], corpus: &[u8], leftmost
     println!("  sparrow                  {:8.3} GB/s   {} matches", gb / t, n_sp);
     let (t, n_so) = time_best_of(|| sp_sparse.find_all(hay).len());
     println!("  sparrow (sparse only)    {:8.3} GB/s   {} matches", gb / t, n_so);
+    let (t, n_cnt) = time_best_of(|| sp.count_all(hay));
+    println!("  sparrow count_all        {:8.3} GB/s   {} matches", gb / t, n_cnt);
+    assert_eq!(n_sp, n_cnt, "count_all must agree");
     let (t, n_ac) = time_best_of(|| ac_dfa.find_overlapping_iter(hay).count());
     println!("  aho-corasick DFA (ovlp)  {:8.3} GB/s   {} matches", gb / t, n_ac);
     assert_eq!(n_sp, n_so, "two-prong and sparse-only must agree");

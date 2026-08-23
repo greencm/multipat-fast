@@ -200,6 +200,9 @@ fn run_workload(name: &str, patterns: &[Vec<u8>], hay: &[u8], corpus: &[u8]) {
     }
     let (t, n_pre) = time_best_of(|| sp_prefix.find_all(hay).len());
     println!("  sparrow (prefix ablate)  {:8.3} GB/s   {} matches", gb / t, n_pre);
+    let (t, n_cnt) = time_best_of(|| sp2.count_all(hay));
+    println!("  sparrow count_all        {:8.3} GB/s   {} matches", gb / t, n_cnt);
+    assert_eq!(n_sp, n_cnt, "count_all must agree with find_all");
     let (t, n_ac) = time_best_of(|| ac_dfa.find_overlapping_iter(hay).count());
     println!("  aho-corasick DFA (ovlp)  {:8.3} GB/s   {} matches", gb / t, n_ac);
     if let Some(ref pk) = packed {

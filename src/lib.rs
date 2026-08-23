@@ -415,6 +415,36 @@ pub(crate) struct ScanCtx<'a> {
     pub patterns: &'a [Pat],
 }
 
+/// Where kernels deliver matches: a `Vec` (`find_all`), a counter
+/// (`count_all`), or a user callback (`scan_with`). Monomorphised — no
+/// dynamic dispatch on the emit path.
+pub(crate) trait Sink {
+    fn accept(&mut self, m: Match);
+}
+
+impl Sink for Vec<Match> {
+    #[inline(always)]
+    fn accept(&mut self, m: Match) {
+        self.push(m);
+    }
+}
+
+pub(crate) struct CountSink(pub usize);
+impl Sink for CountSink {
+    #[inline(always)]
+    fn accept(&mut self, _m: Match) {
+        self.0 += 1;
+    }
+}
+
+pub(crate) struct FnSink<F: FnMut(Match)>(pub F);
+impl<F: FnMut(Match)> Sink for FnSink<F> {
+    #[inline(always)]
+    fn accept(&mut self, m: Match) {
+        (self.0)(m);
+    }
+}
+
 impl Sparrow {
     /// Build with default settings. See [`Builder`] for knobs.
     pub fn new<I, P>(patterns: I) -> Result<Sparrow, BuildError>
@@ -458,6 +488,39 @@ impl Sparrow {
         out
     }
 
+    /// Invoke `f` for every (overlapping) occurrence, without
+    /// materialising a `Vec`. Emission order is the engines' native order:
+    /// each cohort emits in increasing position, and the dense lane emits
+    /// per 64 KB chunk in interleaved-segment order — *not* globally
+    /// sorted. Use [`find_all`](Self::find_all) when order matters.
+    pub fn scan_with<F: FnMut(Match)>(&self, haystack: &[u8], f: F) {
+        let mut sink = FnSink(f);
+        scan_unordered(
+            &self.cohorts,
+            self.dense.as_ref(),
+            &self.patterns,
+            self.engine,
+            haystack,
+            &mut sink,
+        );
+    }
+
+    /// Number of (overlapping) occurrences, skipping the output path
+    /// entirely (no allocation, no ordering). On match-dense inputs this
+    /// is measurably faster than `find_all(..).len()`.
+    pub fn count_all(&self, haystack: &[u8]) -> usize {
+        let mut sink = CountSink(0);
+        scan_unordered(
+            &self.cohorts,
+            self.dense.as_ref(),
+            &self.patterns,
+            self.engine,
+            haystack,
+            &mut sink,
+        );
+        sink.0
+    }
+
     /// How the dense/sparse split was decided at build time.
     pub fn routing_decision(&self) -> &RoutingDecision {
         &self.decision
@@ -484,7 +547,26 @@ pub(crate) fn scan_all(
     }
 }
 
-fn scan_cohort(engine: Engine, ctx: &ScanCtx<'_>, hay: &[u8], out: &mut Vec<Match>) {
+/// Sink-directed variant of [`scan_all`]: same kernels, but the dense lane
+/// skips its per-segment run ordering and emits straight into the sink.
+pub(crate) fn scan_unordered<S: Sink>(
+    cohorts: &[Compiled],
+    dense: Option<&DenseLane>,
+    patterns: &[Pat],
+    engine: Engine,
+    hay: &[u8],
+    sink: &mut S,
+) {
+    for c in cohorts {
+        let ctx = ScanCtx { c, patterns };
+        scan_cohort(engine, &ctx, hay, sink);
+    }
+    if let Some(d) = dense {
+        d.scan_unordered(hay, sink);
+    }
+}
+
+fn scan_cohort<S: Sink>(engine: Engine, ctx: &ScanCtx<'_>, hay: &[u8], out: &mut S) {
         #[cfg(target_arch = "x86_64")]
         match engine {
             Engine::Avx512 if hay.len() >= 96 => {
@@ -801,13 +883,13 @@ pub(crate) fn pattern_matches(window: &[u8], pat: &Pat) -> bool {
 /// every entry of every flagged bucket at the implied start position, guard
 /// byte first. Shared by all engines.
 #[inline]
-pub(crate) fn verify_at(
+pub(crate) fn verify_at<S: Sink>(
     ctx: &ScanCtx<'_>,
     hay: &[u8],
     t: usize,
     mut mask: u8,
     plane: usize,
-    out: &mut Vec<Match>,
+    out: &mut S,
 ) {
     // Window start implied by the anchor. Bits produced near the beginning
     // of the haystack can imply a start before offset 0; those are filter
@@ -841,13 +923,13 @@ pub(crate) fn verify_at(
 /// model-rarest unsampled pattern position — rejects most false
 /// candidates with one load), then the full comparison.
 #[inline(always)]
-fn check_entry(
+fn check_entry<S: Sink>(
     ctx: &ScanCtx<'_>,
     hay: &[u8],
     start: usize,
     id: u32,
     guard_off: u32,
-    out: &mut Vec<Match>,
+    out: &mut S,
 ) {
     let p = &ctx.patterns[id as usize];
     let end = start + p.len();
@@ -860,6 +942,6 @@ fn check_entry(
         return;
     }
     if pattern_matches(&hay[start..end], p) {
-        out.push(Match { start, end, pattern: id as usize });
+        out.accept(Match { start, end, pattern: id as usize });
     }
 }

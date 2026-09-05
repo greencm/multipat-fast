@@ -47,6 +47,23 @@ Three structural constants stand out across every family:
    one filter for the whole pattern set — decided by the implementation,
    not by the workload.
 
+**The literal-first architecture itself is older than the SIMD filters.**
+Snort's `fast_pattern` (Norton & Roelker, 2004; Snort 2.x `search-method
+mwm`) picked one literal per rule — by default the longest `content:` —
+ran all of them through a Modified Wu-Manber multi-pattern matcher, and
+evaluated the rest of a rule (`pcre`, `byte_test`, …) only when its fast
+pattern fired. Two lessons from that deployment carry straight into
+SPARROW. First, the literal that filters is whichever *the rule contains*,
+anywhere in the rule — Snort's contents are literal by syntax, so the
+choice was free; our regex prefilter (§3.6) currently extracts *prefix*
+literals only, and inner/suffix extraction is what would close the gap.
+Second, MWM's block shift is bounded by the shortest fast pattern, and a
+single short one (`GET `) collapsed the whole matcher's skip distance —
+the same shortest-pattern-pins-the-window pathology §3.4's length cohorts
+and §3.5's dense lane exist to quarantine. (Snort 3 replaced MWM with
+Hyperscan for the reason the benchmark's Wu-Manber column shows: skipping
+bytes loses to a SIMD filter that touches every byte 16–64 at a time.)
+
 These constants are exploitable weaknesses. Contiguous prefixes are
 catastrophic when patterns share a common prefix ("GET /api/v1/…",
 `\x7fELF`, TLS record headers…) — the *common case* in the workloads these

@@ -395,6 +395,21 @@ fn line_text<'a>(data: &'a [u8], starts: &[usize], line: usize) -> &'a [u8] {
     &data[start..end]
 }
 
+/// Write one line to `out`. If the reader on the other end of stdout has
+/// gone away (e.g. piped into `head`), exit immediately and quietly — the
+/// conventional Unix behavior — instead of returning an error that would
+/// otherwise print an ugly "Broken pipe (os error 32)" for every
+/// subsequent line.
+fn write_line(out: &mut impl Write, line: &str) -> Result<(), String> {
+    if let Err(e) = writeln!(out, "{line}") {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        return Err(e.to_string());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_file(
     mode: &Mode,
@@ -432,9 +447,9 @@ fn scan_file(
             let p = prefix(line_no);
             let text = String::from_utf8_lossy(&data[s.start..s.end]);
             if p.is_empty() {
-                writeln!(out, "{text}").map_err(|e| e.to_string())?;
+                write_line(out, &text)?;
             } else {
-                writeln!(out, "{p}{text}").map_err(|e| e.to_string())?;
+                write_line(out, &format!("{p}{text}"))?;
             }
             printed = true;
         }
@@ -444,7 +459,7 @@ fn scan_file(
     if opts.files_with_matches {
         let hit = matched_line.iter().any(|&m| m != opts.invert);
         if hit {
-            writeln!(out, "{}", label.unwrap_or("(stdin)")).map_err(|e| e.to_string())?;
+            write_line(out, label.unwrap_or("(stdin)"))?;
             printed = true;
         }
         return Ok(printed);
@@ -453,9 +468,9 @@ fn scan_file(
     if opts.count {
         let n = matched_line.iter().filter(|&&m| m != opts.invert).count();
         if show_filename {
-            writeln!(out, "{}:{n}", label.unwrap_or("")).map_err(|e| e.to_string())?;
+            write_line(out, &format!("{}:{n}", label.unwrap_or("")))?;
         } else {
-            writeln!(out, "{n}").map_err(|e| e.to_string())?;
+            write_line(out, &n.to_string())?;
         }
         printed = n > 0;
         return Ok(printed);
@@ -467,7 +482,7 @@ fn scan_file(
         }
         let text = line_text(data, &starts, line_no);
         let p = prefix(line_no);
-        writeln!(out, "{p}{}", String::from_utf8_lossy(text)).map_err(|e| e.to_string())?;
+        write_line(out, &format!("{p}{}", String::from_utf8_lossy(text)))?;
         printed = true;
     }
     Ok(printed)

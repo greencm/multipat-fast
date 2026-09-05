@@ -196,32 +196,40 @@ Other knobs: `max_positions(k)`, `wildcard_byte(Some(b'?'))`,
 
 ## srg — a subset ripgrep built on SPARROW
 
-`srg` is a small, honest ripgrep clone: a real end-user CLI that scans a
-whole file's bytes in one pass against many patterns at once, instead of
-looping a regex over lines. That single-pass-over-many-patterns design is
-SPARROW's actual differentiator, so `srg` leans on `-e` (repeatable) to
-show it off directly:
+This repo ships a small CLI, `srg`, alongside the library: a real,
+runnable command that scans a whole file's bytes in one pass against many
+patterns at once, instead of looping a regex over lines per pattern. That
+single-pass-over-many-patterns design is SPARROW's actual differentiator,
+so `srg` leans on `-e` (repeatable) to show it off directly, and doubles
+as proof the library works outside a benchmark harness.
 
 ```
-cargo run --release --bin srg -- -n -e "TODO" -e "FIXME" -e "unsafe" src/
+# Build it (literal patterns only, no extra deps):
+cargo build --release --bin srg
+
+# One pass over src/, checking five literal patterns at once:
+./target/release/srg -n -e TODO -e FIXME -e unsafe -e "unwrap()" -e "expect(" src/
+
+# Just the filenames that mention "unsafe", recursively:
+./target/release/srg -l "unsafe" src/
+
+# With --features prefilter, patterns become real regexes, matched
+# through the same shared-prefix filter as the IDS workload above:
+cargo build --release --bin srg --features prefilter
+./target/release/srg -n -e 'GET /api/v1/\w+\?id=\d+' access.log
 ```
 
-By default `srg` matches literal strings only (fast, dependency-free). With
-`cargo build --features prefilter`, patterns become byte-oriented regexes,
-matched through the [regex literal prefilter](docs/DESIGN.md#36-regex-literal-prefilter)
-in front of `regex-automata`.
-
-Supported: `-i/--ignore-case`, `-v/--invert-match`, `-w/--word-regexp`,
-`-F/--fixed-strings`, `-o/--only-matching`, `-c/--count`,
-`-l/--files-with-matches`, `-n`/`-N/--no-line-number`, repeatable `-e`,
-automatic recursive directory search (skipping dotfiles and
-`target`/`node_modules`/`.git`/`.hg`/`.svn`), stdin input, and a binary-file
-skip heuristic.
-
-Not supported, on purpose: `.gitignore`/`.ignore` respecting, glob/type
-filtering, context lines (`-A/-B/-C`), color output, multiline patterns,
-PCRE-only regex features, `--replace`, JSON output — reach for real
-ripgrep when you need those. Run `srg --help` for the full flag reference.
+It supports `-i/-v/-w/-F/-o/-c/-l/-n/-N`, repeatable `-e`, automatic
+recursive directory search (skipping dotfiles and
+`target`/`node_modules`/`.git`/`.hg`/`.svn`), stdin input, and a
+binary-file skip heuristic — and is explicit about what it leaves out on
+purpose (`.gitignore`, glob filtering, context lines, color, multiline,
+JSON output). Run `srg --help` for the flag reference, or see
+**[`docs/SRG.md`](docs/SRG.md)** for the full guide: what it's for, why it
+exists, a complete flag table, exit codes, and six concrete use cases
+(multi-keyword audits, security sweeps, log triage via stdin, corpus
+frequency checks, shared-prefix regex rules, and `-o` extraction
+pipelines).
 
 ## Repo layout
 
@@ -247,3 +255,5 @@ ripgrep when you need those. Run `srg --help` for the full flag reference.
 - `examples/dense_probe.rs` — dense-lane microbenchmark (scan vs hit cost)
 - `examples/regex_prefilter.rs` — the regex-prefilter benchmark
   (`cargo run --release --features prefilter --example regex_prefilter`)
+- `src/bin/srg.rs` — the `srg` CLI; `tests/srg_cli.rs` — its end-to-end
+  test suite, run against the built binary; `docs/SRG.md` — the user guide

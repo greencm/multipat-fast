@@ -446,7 +446,8 @@ impl DenseLane {
         let (p0, p1, p2, p3) = unsafe {
             (base.add(pos[0]), base.add(pos[1]), base.add(pos[2]), base.add(pos[3]))
         };
-        let ones = unsafe { vdupq_n_u64(u64::MAX) };
+        // `vdupq_n_u64` is a safe fn (baseline NEON, no pointer access).
+        let ones = vdupq_n_u64(u64::MAX);
         let (mut s0, mut s1, mut s2, mut s3) = (ones, ones, ones, ones);
         let mut ev = [Event { step: 0, st: [0; 8] }; EVENTS];
         let mut step = 0usize;

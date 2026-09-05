@@ -258,16 +258,43 @@ measures 1.5 vs 1.1 ns/byte on the sample and keeps sparse-only.
 ### 3.6 Regex literal prefilter
 
 `prefilter::Prefilter` (feature `prefilter`) is the Hyperscan-shaped
-integration the design was written for: `regex-syntax`'s prefix-literal
-extractor yields, for each regex, a finite set of literals such that
-every match begins with one of them; SPARROW matches the union (IDS-style
-rules share those prefixes pathologically — exactly workload 3); each
-candidate is confirmed by an anchored `regex-automata` search over the
-full haystack with a span, so look-behinds (`^`, `\b`) stay exact. The
-per-regex resume rule reproduces `find_iter` semantics exactly, and
-regexes with no usable prefix set (can match empty, infinite prefixes)
-run unfiltered — completeness for every accepted regex, no false
-negatives by construction.
+integration the design was written for: match a *set* of regexes at
+literal-filter speed, invoking the regex engine only where a match is
+possible. Three steps:
+
+1. **Extract.** For each regex, `regex-syntax`'s prefix-literal
+   `Extractor` yields a finite set of byte strings such that every match
+   of that regex begins with one of them. `GET /api/v1/(foo|bar)\?vuln`
+   yields two literals (`…/foo?vuln`, `…/bar?vuln`); `GET /api/v1/foo\?id=\d+`
+   yields one (`GET /api/v1/foo?id=`) — the literal stops where the regex
+   stops being literal. Regexes with no usable finite set (can match
+   empty, `.*foo`, unbounded alternation) are marked *unfiltered*.
+2. **Filter.** SPARROW is built over the union of all extracted literals
+   (deduplicated, each literal mapped to the regexes that require it) and
+   scans the haystack once. Every literal hit is a *candidate* for its
+   regexes; a position with no hit cannot start a match of any filtered
+   regex.
+3. **Confirm.** At each candidate, the corresponding regex runs anchored
+   at the candidate start over the full haystack with a span (so
+   look-behinds like `^` and `\b` see the real context and stay exact).
+   Unfiltered regexes run over the whole haystack. A per-regex resume rule
+   reproduces `find_iter`'s leftmost-first, non-overlapping semantics
+   exactly.
+
+No false negatives, by construction, for every regex accepted.
+
+**Why SPARROW and not any literal filter.** Rule sets like this share
+long prefixes pathologically — every rule above starts `GET /api/v1/`,
+and on the wire nearly every *request* does too. A prefix-anchored filter
+(Teddy, which `regex-automata` uses internally) keys on the first few
+bytes, so on such traffic every line is a candidate and the regex engine
+runs on all of them: the filter buys nothing. SPARROW's position
+optimizer measures that the prefix bytes carry no information on the
+corpus sample and samples positions past them — the bytes where rules
+actually diverge — so near-miss lines (`GET /api/v1/zzz…`) are rejected
+in the SIMD filter. This is exactly workload 3 of the benchmark, and the
+reason the prefilter measures 5.5 GB/s against 2.1 for regex-automata's
+own multi-pattern path on the same rules.
 
 ### 3.6b Four bucket planes
 

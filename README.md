@@ -143,13 +143,39 @@ ROADMAP §3), not faster confirmation.
   parity with packed Teddy); streaming with cross-chunk matches
   (`stream()`), ASCII case-insensitive mode, single-byte pattern wildcards
   (`?`-globs).
-- **Regex prefilter** (`--features prefilter`): extract each regex's
-  required prefix literals (`regex-syntax`), SPARROW the union, confirm
-  candidates with anchored `regex-automata` searches. No false negatives;
-  regexes with no finite prefix set run unfiltered. On 50 IDS-style rules
-  sharing the `GET /api/v1/` prefix over the near-miss log: **5.5 GB/s**
-  vs 2.1 for regex-automata's own multi-regex engine (internal Teddy) and
-  0.25 for per-regex scans.
+- **Regex prefilter** (`--features prefilter`): run a *set* of regexes
+  (IDS rules, WAF signatures, log alerts) at literal-matcher speed, only
+  paying the regex engine on lines that could possibly match. Say the
+  rules are
+
+  ```
+  GET /api/v1/(foo|bar)\?vulnerable
+  GET /api/v1/foo\?id=\d+
+  GET /api/v1/bar/[0-9a-f]{4,}
+  ```
+
+  Step 1: `regex-syntax` extracts, per regex, the finite set of literal
+  strings every match *must start with*: `GET /api/v1/foo?vulnerable`,
+  `GET /api/v1/bar?vulnerable`, `GET /api/v1/foo?id=`, `GET /api/v1/bar/`.
+  Step 2: SPARROW is built over the union of those literals and scans the
+  haystack; each hit names the regexes that need it. Step 3: only at
+  those positions, `regex-automata` runs the full regex, anchored at the
+  literal, to confirm (so `\d+`, `{4,}`, `^`, `\b` are all still exact).
+  A regex with no finite required prefix (`.*vulnerable`, `\d+bar`,
+  anything that can match empty) is simply run unfiltered over the whole
+  input — so there are **no false negatives** for any regex accepted.
+
+  The part that makes this fast is *not* the shared `GET /api/v1/`
+  prefix — that prefix is the trap. On a real web server nearly every
+  request line starts with it, so a filter that keys on the first bytes
+  (Teddy, which is what `regex`/`regex-automata` use internally) flags
+  every line as a candidate and falls into the slow path constantly.
+  SPARROW's optimizer sees that those bytes carry no information and
+  samples *past* them (in this example it picks byte 0 and byte 15, the
+  `?`-vs-`/` right after the route name), so `GET /api/v1/zzz…` near-miss
+  lines are rejected in the SIMD filter and never reach the regex engine.
+  On 50 such rules over the near-miss log: **5.5 GB/s** vs 2.1 for
+  regex-automata's own multi-regex engine and 0.25 for one scan per regex.
 - **Verification**: per-entry guard probes (the model-rarest unsampled
   pattern byte) reject most false candidates with one load.
 - **Dense lane (two-prong build)**: patterns no sampled-position filter

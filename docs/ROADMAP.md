@@ -269,7 +269,9 @@ which share prefixes pathologically. Integration point: a
 `regex-automata`'s `Prefilter` trait. Effort: M (the trait adapter is
 small; literal extraction exists in `regex-syntax`). **Verdict: do** —
 it is the route to actual users, and the design's thesis was written for
-exactly this workload.
+exactly this workload. **Status: delivered** — `008169e` (Prefilter API)
+and `src/bin/srg.rs` (a real CLI consumer, both literal and `--features
+prefilter` regex modes).
 
 ### 4.2 Case folding beyond ASCII / UTF-8 awareness
 Unicode case folding is multi-byte and length-changing (`ß` ↔ `SS`) — it

@@ -194,6 +194,35 @@ Other knobs: `max_positions(k)`, `wildcard_byte(Some(b'?'))`,
 (pure closed-form selection), `exhaustive_search(true)`,
 `force_engine(Engine::Avx2)`, `dense_lane(false)`, `timed_referee(false)`.
 
+## srg — a subset ripgrep built on SPARROW
+
+`srg` is a small, honest ripgrep clone: a real end-user CLI that scans a
+whole file's bytes in one pass against many patterns at once, instead of
+looping a regex over lines. That single-pass-over-many-patterns design is
+SPARROW's actual differentiator, so `srg` leans on `-e` (repeatable) to
+show it off directly:
+
+```
+cargo run --release --bin srg -- -n -e "TODO" -e "FIXME" -e "unsafe" src/
+```
+
+By default `srg` matches literal strings only (fast, dependency-free). With
+`cargo build --features prefilter`, patterns become byte-oriented regexes,
+matched through the [regex literal prefilter](docs/DESIGN.md#36-regex-literal-prefilter)
+in front of `regex-automata`.
+
+Supported: `-i/--ignore-case`, `-v/--invert-match`, `-w/--word-regexp`,
+`-F/--fixed-strings`, `-o/--only-matching`, `-c/--count`,
+`-l/--files-with-matches`, `-n`/`-N/--no-line-number`, repeatable `-e`,
+automatic recursive directory search (skipping dotfiles and
+`target`/`node_modules`/`.git`/`.hg`/`.svn`), stdin input, and a binary-file
+skip heuristic.
+
+Not supported, on purpose: `.gitignore`/`.ignore` respecting, glob/type
+filtering, context lines (`-A/-B/-C`), color output, multiline patterns,
+PCRE-only regex features, `--replace`, JSON output — reach for real
+ripgrep when you need those. Run `srg --help` for the full flag reference.
+
 ## Repo layout
 
 - `src/builder.rs` — the offline optimizer (byte classes, closure-exact

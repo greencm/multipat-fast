@@ -194,6 +194,43 @@ Other knobs: `max_positions(k)`, `wildcard_byte(Some(b'?'))`,
 (pure closed-form selection), `exhaustive_search(true)`,
 `force_engine(Engine::Avx2)`, `dense_lane(false)`, `timed_referee(false)`.
 
+## srg — a subset ripgrep built on SPARROW
+
+This repo ships a small CLI, `srg`, alongside the library: a real,
+runnable command that scans a whole file's bytes in one pass against many
+patterns at once, instead of looping a regex over lines per pattern. That
+single-pass-over-many-patterns design is SPARROW's actual differentiator,
+so `srg` leans on `-e` (repeatable) to show it off directly, and doubles
+as proof the library works outside a benchmark harness.
+
+```
+# Build it (literal patterns only, no extra deps):
+cargo build --release --bin srg
+
+# One pass over src/, checking five literal patterns at once:
+./target/release/srg -n -e TODO -e FIXME -e unsafe -e "unwrap()" -e "expect(" src/
+
+# Just the filenames that mention "unsafe", recursively:
+./target/release/srg -l "unsafe" src/
+
+# With --features prefilter, patterns become real regexes, matched
+# through the same shared-prefix filter as the IDS workload above:
+cargo build --release --bin srg --features prefilter
+./target/release/srg -n -e 'GET /api/v1/\w+\?id=\d+' access.log
+```
+
+It supports `-i/-v/-w/-F/-o/-c/-l/-n/-N`, repeatable `-e`, automatic
+recursive directory search (skipping dotfiles and
+`target`/`node_modules`/`.git`/`.hg`/`.svn`), stdin input, and a
+binary-file skip heuristic — and is explicit about what it leaves out on
+purpose (`.gitignore`, glob filtering, context lines, color, multiline,
+JSON output). Run `srg --help` for the flag reference, or see
+**[`docs/SRG.md`](docs/SRG.md)** for the full guide: what it's for, why it
+exists, a complete flag table, exit codes, and six concrete use cases
+(multi-keyword audits, security sweeps, log triage via stdin, corpus
+frequency checks, shared-prefix regex rules, and `-o` extraction
+pipelines).
+
 ## Repo layout
 
 - `src/builder.rs` — the offline optimizer (byte classes, closure-exact
@@ -218,3 +255,5 @@ Other knobs: `max_positions(k)`, `wildcard_byte(Some(b'?'))`,
 - `examples/dense_probe.rs` — dense-lane microbenchmark (scan vs hit cost)
 - `examples/regex_prefilter.rs` — the regex-prefilter benchmark
   (`cargo run --release --features prefilter --example regex_prefilter`)
+- `src/bin/srg.rs` — the `srg` CLI; `tests/srg_cli.rs` — its end-to-end
+  test suite, run against the built binary; `docs/SRG.md` — the user guide
